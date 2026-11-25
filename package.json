@@ -1,0 +1,39 @@
+{
+  "name": "ninteli-ai",
+  "version": "1.0.0",
+  "description": "CIVIS — Bot Discord d'administration de serveur propulse par IA locale (llama.cpp) et APIs externes avec validation par boutons et journalisation chiffree.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "keywords": [
+    "discord",
+    "discord-bot",
+    "discord-js",
+    "ai-agent",
+    "llm",
+    "llama-cpp",
+    "local-ai",
+    "moderation"
+  ],
+  "author": "Ninteli pour Furcitivas",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ninteli/CIVIS.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ninteli/CIVIS/issues"
+  },
+  "homepage": "https://github.com/ninteli/CIVIS#readme",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^18.0.8"
+  },
+  "devDependencies": {}
+}

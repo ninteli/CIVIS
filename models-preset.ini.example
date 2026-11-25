@@ -1,0 +1,22 @@
+version = 1
+
+[*]
+c = 4096
+np = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+t = 8
+sleep-idle-seconds = 900
+load-on-startup = false
+
+[gemma3:1B]
+model = __MODELS_DIR__/gemma-3-1b-it-q4_k_m.gguf
+load-on-startup = true
+sleep-idle-seconds = 900
+
+[qwen2.5:3B]
+model = __MODELS_DIR__/qwen2.5-3b-instruct-q4_k_m.gguf
+c = 8192
+load-on-startup = false
+sleep-idle-seconds = 900
