@@ -1,12 +1,34 @@
-const { Events } = require('discord.js');
+const { Events, ActivityType } = require('discord.js');
 const debug = require('../agent/debug');
 const brain = require('../agent/brain');
 const rateLimit = require('../agent/rate-limit');
+const antiNuke = require('../agent/anti-nuke');
+const { isGuildOwner } = require('../agent/permissions');
+const versionManager = require('../version');
 const auditSuggestions = require('./audit-suggestions');
 const {
   buildNoticePayload,
   buildChatReplyPayload,
+  sanitizePublicError,
 } = require('./format');
+
+function applyVersionPresence(client, version = versionManager.getCurrentVersion()) {
+  if (!client || !client.user || typeof client.user.setPresence !== 'function') {
+    return null;
+  }
+  const statusText = versionManager.formatStatusText(version);
+  client.user.setPresence({
+    status: 'online',
+    activities: [
+      {
+        name: statusText,
+        state: statusText,
+        type: ActivityType.Custom,
+      },
+    ],
+  });
+  return statusText;
+}
 
 function cleanMessage(content, clientUser) {
   let cleaned = content;
@@ -18,9 +40,17 @@ function cleanMessage(content, clientUser) {
   return cleaned.trim();
 }
 
-module.exports = (client) => {
+function registerEvents(client) {
   client.once('clientReady', () => {
-    console.log('[events] Connecte en tant que ' + client.user.tag);
+    const version = versionManager.getCurrentVersion();
+    const statusText = applyVersionPresence(client, version);
+    console.log(
+      '[events] Connecte en tant que ' +
+        client.user.tag +
+        ' (' +
+        (statusText || 'v' + version) +
+        ')'
+    );
   });
 
   client.on(Events.GuildAuditLogEntryCreate, (auditLogEntry, guild) => {
@@ -35,6 +65,24 @@ module.exports = (client) => {
     if (message.author.bot) return;
     if (!message.guild) return;
     if (!message.mentions.has(client.user)) return;
+
+    if (!isGuildOwner(message.guild, message.member || message.author)) {
+      const lock = antiNuke.checkUserLockout(message.guild.id, message.author.id);
+      if (lock.locked) {
+        const mins = Math.floor(lock.remainingSec / 60);
+        const secs = lock.remainingSec % 60;
+        const timeLabel = mins > 0 ? `${mins} min ${secs}s` : `${secs}s`;
+        return message.reply(
+          buildNoticePayload({
+            type: 'error',
+            title: '🚨 Acces bloque par l anti-nuke',
+            description:
+              `Toute intervention envers CIVIS est bloquee pour toi pendant encore **${timeLabel}**.\n` +
+              `• **Motif** : ${lock.reason}`,
+          })
+        );
+      }
+    }
 
     const userText = cleanMessage(message.content, client.user);
     if (!userText) {
@@ -89,11 +137,18 @@ module.exports = (client) => {
         buildNoticePayload({
           type: 'error',
           title: '❌ Erreur',
-          description: err.message,
+          description: sanitizePublicError(
+            err,
+            'Une erreur interne est survenue (service IA temporairement indisponible).'
+          ),
         })
       );
     } finally {
       rateLimit.release(message.author.id);
     }
   });
-};
+}
+
+registerEvents.applyVersionPresence = applyVersionPresence;
+
+module.exports = registerEvents;

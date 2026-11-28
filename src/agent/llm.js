@@ -1,6 +1,14 @@
 const { validateCustomUrlDns } = require('./user-keys');
+let undici = null;
+try {
+  undici = require('undici');
+} catch {
+  undici = null;
+}
 
 const LLM_URL = process.env.LLM_URL || 'http://127.0.0.1:8080';
+const MAX_LLM_RESPONSE_BYTES = 1024 * 1024; // 1 Mo
+const MAX_LLM_ERROR_BYTES = 64 * 1024; // 64 Ko
 
 const LOCAL_MODELS = {
   chat: process.env.LLM_CHAT_MODEL || 'gemma3:1B',
@@ -138,6 +146,62 @@ function extractSafeApiErrorMessage(rawText, apiKey) {
   return message.replace(/\s+/g, ' ').trim().slice(0, 180);
 }
 
+async function readResponseTextWithLimit(res, maxBytes) {
+  const contentLengthHeader = res?.headers?.get?.('content-length');
+  if (contentLengthHeader) {
+    const declaredLen = Number.parseInt(contentLengthHeader, 10);
+    if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+      try {
+        await res.body?.cancel?.();
+      } catch {
+        // Ignore body cancel failure
+      }
+      const err = new Error('Reponse HTTP trop volumineuse (' + declaredLen + ' octets).');
+      err.apiMessage = 'Réponse serveur trop volumineuse';
+      throw err;
+    }
+  }
+
+  if (res?.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        const buf = Buffer.from(value);
+        totalBytes += buf.byteLength;
+        if (totalBytes > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore reader cancel failure
+          }
+          const err = new Error('Reponse HTTP trop volumineuse (> ' + maxBytes + ' octets).');
+          err.apiMessage = 'Réponse serveur trop volumineuse';
+          throw err;
+        }
+        chunks.push(buf);
+      }
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  }
+
+  if (typeof res?.text === 'function') {
+    const text = await res.text();
+    const byteLen = Buffer.byteLength(text, 'utf8');
+    if (byteLen > maxBytes) {
+      const err = new Error('Reponse HTTP trop volumineuse (' + byteLen + ' octets).');
+      err.apiMessage = 'Réponse serveur trop volumineuse';
+      throw err;
+    }
+    return text;
+  }
+
+  return null;
+}
+
 async function callOpenAICompatible({
   url,
   apiKey,
@@ -147,6 +211,7 @@ async function callOpenAICompatible({
   temperature,
   timeoutMs,
   fetchFn,
+  dispatcher,
 }) {
   const endpoint = String(url).replace(/\/+$/, '') + '/chat/completions';
   const headers = { 'Content-Type': 'application/json' };
@@ -174,6 +239,9 @@ async function callOpenAICompatible({
     body: JSON.stringify(body),
     redirect: 'error',
   };
+  if (dispatcher) {
+    fetchOptions.dispatcher = dispatcher;
+  }
   if (timeoutMs > 0 && typeof AbortSignal?.timeout === 'function') {
     fetchOptions.signal = AbortSignal.timeout(timeoutMs);
   }
@@ -182,15 +250,16 @@ async function callOpenAICompatible({
   const res = await fetchFn(endpoint, fetchOptions);
 
   if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    const apiMessage = extractSafeApiErrorMessage(errText, apiKey);
+    const errText = await readResponseTextWithLimit(res, MAX_LLM_ERROR_BYTES).catch(() => '');
+    const apiMessage = extractSafeApiErrorMessage(errText || '', apiKey);
     const err = new Error('LLM HTTP ' + res.status + (apiMessage ? ': ' + apiMessage : ''));
     err.status = res.status;
     err.apiMessage = apiMessage;
     throw err;
   }
 
-  const data = await res.json();
+  const rawText = await readResponseTextWithLimit(res, MAX_LLM_RESPONSE_BYTES);
+  const data = rawText !== null ? JSON.parse(rawText) : await res.json();
   const elapsedMs = Date.now() - startedAt;
 
   const content = data.choices?.[0]?.message?.content ?? '';
@@ -211,13 +280,53 @@ async function callOpenAICompatible({
 }
 
 async function assertSafeCustomEndpoint(userConfig, { fetchFn, lookupFn } = {}) {
-  if (!userConfig || userConfig.provider !== 'custom') return;
-  if (fetchFn && !lookupFn) return;
+  if (!userConfig || userConfig.provider !== 'custom') return null;
+  if (fetchFn && !lookupFn) return null;
   const check = await validateCustomUrlDns(userConfig.baseUrl, { lookupFn });
   if (!check.ok) {
     const err = new Error(check.error);
     err.apiMessage = check.error;
     throw err;
+  }
+  return check;
+}
+
+async function withPinnedCustomFetch(userConfig, { fetchFn, lookupFn } = {}, runner) {
+  const endpointCheck = await assertSafeCustomEndpoint(userConfig, { fetchFn, lookupFn });
+  if (
+    fetchFn ||
+    !userConfig ||
+    userConfig.provider !== 'custom' ||
+    !endpointCheck?.addresses?.length ||
+    !undici?.Agent ||
+    !undici?.fetch
+  ) {
+    return runner(fetchFn || fetch, undefined);
+  }
+
+  const expectedHost = new URL(userConfig.baseUrl).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const pinnedAddresses = endpointCheck.addresses;
+  const agent = new undici.Agent({
+    connect: {
+      lookup(hostname, options, callback) {
+        const cleanHost = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+        if (cleanHost !== expectedHost) {
+          callback(new Error('Hote inattendu lors de la connexion DNS epinglee.'));
+          return;
+        }
+        if (options && options.all) {
+          callback(null, pinnedAddresses);
+          return;
+        }
+        callback(null, pinnedAddresses[0].address, pinnedAddresses[0].family);
+      },
+    },
+  });
+
+  try {
+    return await runner(undici.fetch, agent);
+  } finally {
+    await agent.close().catch(() => {});
   }
 }
 
@@ -225,64 +334,64 @@ async function listAvailableModels(
   userConfig,
   { timeoutMs = 10_000, fetchFn, lookupFn } = {}
 ) {
-  const fetchImpl = fetchFn || fetch;
   if (!userConfig || !userConfig.baseUrl || !userConfig.apiKey) {
     return { ok: false, status: null, error: 'Configuration API incomplete.' };
   }
 
-  try {
-    await assertSafeCustomEndpoint(userConfig, { fetchFn, lookupFn });
-  } catch (err) {
-    return { ok: false, status: null, error: err.message };
-  }
-
   const endpoint = String(userConfig.baseUrl).replace(/\/+$/, '') + '/models';
-  const fetchOptions = {
-    method: 'GET',
-    headers: {
-      Authorization: 'Bearer ' + userConfig.apiKey,
-    },
-    redirect: 'error',
-  };
-  if (timeoutMs > 0 && typeof AbortSignal?.timeout === 'function') {
-    fetchOptions.signal = AbortSignal.timeout(timeoutMs);
-  }
 
   try {
-    const res = await fetchImpl(endpoint, fetchOptions);
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      return {
-        ok: false,
-        status: res.status,
-        error: extractSafeApiErrorMessage(errText, userConfig.apiKey),
+    return await withPinnedCustomFetch(userConfig, { fetchFn, lookupFn }, async (fetchImpl, dispatcher) => {
+      const fetchOptions = {
+        method: 'GET',
+        headers: {
+          Authorization: 'Bearer ' + userConfig.apiKey,
+        },
+        redirect: 'error',
       };
-    }
-
-    const data = await res.json();
-    const rawList = Array.isArray(data?.data)
-      ? data.data
-      : Array.isArray(data?.models)
-        ? data.models
-        : [];
-
-    const seen = new Set();
-    const models = [];
-    for (const item of rawList) {
-      const rawId = typeof item === 'string' ? item : item?.id || item?.name || '';
-      const id = String(rawId).replace(/^models\//i, '').trim();
-      if (id && !seen.has(id)) {
-        seen.add(id);
-        models.push(id);
+      if (dispatcher) {
+        fetchOptions.dispatcher = dispatcher;
       }
-    }
+      if (timeoutMs > 0 && typeof AbortSignal?.timeout === 'function') {
+        fetchOptions.signal = AbortSignal.timeout(timeoutMs);
+      }
 
-    return { ok: true, models };
+      const res = await fetchImpl(endpoint, fetchOptions);
+      if (!res.ok) {
+        const errText = await readResponseTextWithLimit(res, MAX_LLM_ERROR_BYTES).catch(() => '');
+        return {
+          ok: false,
+          status: res.status,
+          error: extractSafeApiErrorMessage(errText || '', userConfig.apiKey),
+        };
+      }
+
+      const rawText = await readResponseTextWithLimit(res, MAX_LLM_RESPONSE_BYTES);
+      const data = rawText !== null ? JSON.parse(rawText) : await res.json();
+      const rawList = Array.isArray(data?.data)
+        ? data.data
+        : Array.isArray(data?.models)
+          ? data.models
+          : [];
+
+      const seen = new Set();
+      const models = [];
+      for (const item of rawList) {
+        const rawId = typeof item === 'string' ? item : item?.id || item?.name || '';
+        const id = String(rawId).replace(/^models\//i, '').trim();
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          models.push(id);
+        }
+      }
+
+      return { ok: true, models };
+    });
   } catch (err) {
     return {
       ok: false,
       status: err?.status || null,
-      error: classifyApiError(err, err?.status),
+      error: err?.apiMessage || classifyApiError(err, err?.status),
     };
   }
 }
@@ -379,19 +488,23 @@ function pickCandidateModels(provider, modelIds) {
 }
 
 async function testUserConfig(userConfig, { timeoutMs = 15_000, fetchFn, lookupFn } = {}) {
-  const fetchImpl = fetchFn || fetch;
   try {
-    await assertSafeCustomEndpoint(userConfig, { fetchFn, lookupFn });
-    const res = await callOpenAICompatible({
-      url: userConfig.baseUrl,
-      apiKey: userConfig.apiKey,
-      model: userConfig.model,
-      messages: [{ role: 'user', content: 'Reply OK' }],
-      maxTokens: 256,
-      temperature: undefined,
-      timeoutMs,
-      fetchFn: fetchImpl,
-    });
+    const res = await withPinnedCustomFetch(
+      userConfig,
+      { fetchFn, lookupFn },
+      (fetchImpl, dispatcher) =>
+        callOpenAICompatible({
+          url: userConfig.baseUrl,
+          apiKey: userConfig.apiKey,
+          model: userConfig.model,
+          messages: [{ role: 'user', content: 'Reply OK' }],
+          maxTokens: 256,
+          temperature: undefined,
+          timeoutMs,
+          fetchFn: fetchImpl,
+          dispatcher,
+        })
+    );
     return {
       ok: true,
       model: res.stats.model || userConfig.model,
@@ -409,10 +522,9 @@ async function testUserConfig(userConfig, { timeoutMs = 15_000, fetchFn, lookupF
 
 async function verifyAndResolveModel(
   userConfig,
-  { allowAutoPick = true, timeoutMs = 15_000, fetchFn } = {}
+  { allowAutoPick = true, timeoutMs = 15_000, fetchFn, lookupFn } = {}
 ) {
-  const fetchImpl = fetchFn || fetch;
-  const first = await testUserConfig(userConfig, { timeoutMs, fetchFn: fetchImpl });
+  const first = await testUserConfig(userConfig, { timeoutMs, fetchFn, lookupFn });
 
   if (first.ok) {
     return {
@@ -426,7 +538,8 @@ async function verifyAndResolveModel(
   if (first.status === 404) {
     const list = await listAvailableModels(userConfig, {
       timeoutMs: Math.min(timeoutMs, 10_000),
-      fetchFn: fetchImpl,
+      fetchFn,
+      lookupFn,
     });
     const candidates = list.ok
       ? pickCandidateModels(userConfig.provider, list.models).filter(
@@ -439,7 +552,7 @@ async function verifyAndResolveModel(
       for (const candidate of candidates.slice(0, 4)) {
         const attempt = await testUserConfig(
           { ...userConfig, model: candidate },
-          { timeoutMs: Math.min(timeoutMs, 12_000), fetchFn: fetchImpl }
+          { timeoutMs: Math.min(timeoutMs, 12_000), fetchFn, lookupFn }
         );
         if (attempt.ok) {
           return {
@@ -497,8 +610,10 @@ async function chat(messages, options = {}) {
 
   async function invokeLocalLLM(fallbackMeta = null) {
     const normalizedMessages = normalizeAlternatingMessages(messages);
+    const localApiKey = (process.env.LLM_API_KEY || '').trim() || undefined;
     const localRes = await callOpenAICompatible({
       url: LLM_URL + '/v1',
+      apiKey: localApiKey,
       model: localModel,
       messages: normalizedMessages,
       maxTokens: resolvedMaxTokens,
@@ -551,20 +666,22 @@ async function chat(messages, options = {}) {
 
   if (userConfig && userConfig.baseUrl && userConfig.apiKey) {
     try {
-      await assertSafeCustomEndpoint(userConfig, {
-        fetchFn: options.fetchFn,
-        lookupFn: options.lookupFn,
-      });
-      const ext = await callOpenAICompatible({
-        url: userConfig.baseUrl,
-        apiKey: userConfig.apiKey,
-        model: userConfig.model,
-        messages,
-        maxTokens: resolvedMaxTokens,
-        temperature: resolvedTemperature,
-        timeoutMs: options.timeoutMs ?? 25_000,
-        fetchFn: fetchImpl,
-      });
+      const ext = await withPinnedCustomFetch(
+        userConfig,
+        { fetchFn: options.fetchFn, lookupFn: options.lookupFn },
+        (effectiveFetch, dispatcher) =>
+          callOpenAICompatible({
+            url: userConfig.baseUrl,
+            apiKey: userConfig.apiKey,
+            model: userConfig.model,
+            messages,
+            maxTokens: resolvedMaxTokens,
+            temperature: resolvedTemperature,
+            timeoutMs: options.timeoutMs ?? 25_000,
+            fetchFn: effectiveFetch,
+            dispatcher,
+          })
+      );
 
       return {
         content: ext.content,
@@ -601,6 +718,8 @@ async function chat(messages, options = {}) {
 module.exports = {
   LOCAL_MODELS,
   LOCAL_KEEP_ALIVE,
+  MAX_LLM_RESPONSE_BYTES,
+  MAX_LLM_ERROR_BYTES,
   FALLBACK_REASONS,
   resolveLocalModel,
   normalizeAlternatingMessages,

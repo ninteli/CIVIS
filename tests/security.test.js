@@ -11,6 +11,7 @@ const {
 } = require('discord.js');
 
 const { executeTool, archiveRole } = require('../src/agent/tool-executor');
+const antiNuke = require('../src/agent/anti-nuke');
 const approvals = require('../src/discord/approvals');
 const brain = require('../src/agent/brain');
 const memory = require('../src/agent/memory');
@@ -109,7 +110,9 @@ function createMockChannel({
       if (member?._channelPerms?.has(channel.id)) {
         return new PermissionsBitField(member._channelPerms.get(channel.id));
       }
-      return member?.permissions || new PermissionsBitField();
+      const perms = new PermissionsBitField(member?.permissions || []);
+      perms.add(PermissionsBitField.Flags.ViewChannel);
+      return perms;
     },
     async edit(updates) {
       channel.editCalls.push(updates);
@@ -291,6 +294,7 @@ function createButtonInteraction({
 
 afterEach(() => {
   approvals.clearAllPending();
+  antiNuke.clearAll();
 });
 
 describe('Securite et permissions dans tool-executor', () => {
@@ -1437,6 +1441,53 @@ describe('Archivage direct (archive_channel, archive_role) et anti-hallucination
     );
     assert.equal(brain.tryParseToolCall('Salon #salope archivé avec succès.'), null);
     assert.equal(brain.tryParseToolCall('{"foo": "bar"}'), null);
+    assert.deepEqual(
+      brain.tryParseToolCall(
+        'Voici :\n```json\n{"tool": "list_roles", "args": {}}\n```\n```json\n{"tool": "search_app_directory", "args": {"query": "bot"}}\n```'
+      ),
+      { tool: 'list_roles', args: {} }
+    );
+  });
+
+  it('detectReadToolIntent et brain.processMessage recuperent list_channels et list_roles en mode chat', async () => {
+    assert.equal(brain.detectReadToolIntent('liste les salons'), 'list_channels');
+    assert.equal(brain.detectReadToolIntent('Quels sont les rôles du serveur ?'), 'list_roles');
+    assert.equal(brain.detectReadToolIntent('cree un salon general'), null);
+    assert.equal(brain.detectReadToolIntent('supprime le role VIP'), null);
+
+    const guild = createMockGuild({ botPerms: ['ManageChannels', 'ManageRoles'], botPosition: 50 });
+    const chan = createMockChannel({ id: 'c1', name: 'general' });
+    const role = createMockRole({ id: 'r1', name: 'Moderateur', position: 10 });
+    guild.channels.cache.set(chan.id, chan);
+    guild.roles.cache.set(role.id, role);
+    const admin = createMockMember({ id: 'u1', perms: ['Administrator'], highestPosition: 20 });
+
+    memory.clearHistory('chan-list-recover');
+    let secondSystemPrompt = '';
+    let callCount = 0;
+    const res = await brain.processMessage({
+      userText: 'liste les roles',
+      channelId: 'chan-list-recover',
+      authorName: 'User',
+      authorId: admin.id,
+      guild,
+      member: admin,
+      mode: 'chat',
+      userConfig: null,
+      chatFn: async (msgs) => {
+        callCount += 1;
+        if (callCount === 1) {
+          return { content: 'Voici des roles fictifs...', stats: { elapsedMs: 5 } };
+        }
+        secondSystemPrompt = msgs[0]?.content || '';
+        return { content: '{"tool": "list_roles", "args": {}}', stats: { elapsedMs: 5 } };
+      },
+    });
+    assert.equal(callCount, 2);
+    assert.equal(res.usedTool, 'list_roles');
+    assert.ok(!secondSystemPrompt.includes('reponds UNIQUEMENT en JSON'));
+    assert.match(res.content, /Moderateur/);
+    memory.clearHistory('chan-list-recover');
   });
 
   it('brain.processMessage bloque les hallucinations en mode agent, isole la memoire chat et recupere sur retry strict', async () => {
@@ -2352,6 +2403,12 @@ describe('Stockage chiffre /apikey, fallback API->local et mode agent en 1 appel
       userConfig: null,
       chatFn: async (_msgs, opts) => {
         planRoles.push(opts.localRole);
+        if (opts.localRole === 'chat') {
+          return {
+            content: '1. Objectif : creer la categorie Staff.',
+            stats: { elapsedMs: 5, source: 'local', model: 'gemma3:1B' },
+          };
+        }
         return {
           content: '{"summary":"Staff","steps":[{"tool":"create_category","args":{"name":"Staff"}}]}',
           stats: { elapsedMs: 7, source: 'local', model: 'qwen2.5:3B' },
@@ -2359,7 +2416,9 @@ describe('Stockage chiffre /apikey, fallback API->local et mode agent en 1 appel
       },
     });
     assert.equal(planOut.ok, true);
-    assert.deepEqual(planRoles, ['agent']);
+    assert.deepEqual(planRoles, ['chat', 'agent']);
+    assert.equal(planOut.stats.elapsedMs, 12);
+    assert.equal(planOut.stats.model, 'gemma3:1B -> qwen2.5:3B');
   });
 
   it('brain (mode agent) et planner.buildValidatedPlan isolent le contexte par couple (channelId, authorId)', async () => {

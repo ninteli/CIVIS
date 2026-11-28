@@ -12,6 +12,7 @@ const {
 } = require('discord.js');
 
 const actionLogs = require('../src/discord/action-logs');
+const antiNuke = require('../src/agent/anti-nuke');
 const approvals = require('../src/discord/approvals');
 const plans = require('../src/discord/plans');
 const commands = require('../src/discord/commands');
@@ -176,6 +177,7 @@ describe('Systeme de logs automatiques et webhook (action-logs.js)', () => {
   afterEach(() => {
     approvals.clearAllPending();
     plans.clearAllPendingPlans();
+    antiNuke.clearAll();
     actionLogs.clearWebhookCache();
     delete process.env.KEY_ENCRYPTION_SECRET;
     for (const dir of tempDirs.splice(0, tempDirs.length)) {

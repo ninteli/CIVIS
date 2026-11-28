@@ -3,6 +3,7 @@ const {
   TextDisplayBuilder,
   SeparatorBuilder,
   SeparatorSpacingSize,
+  FileBuilder,
   ComponentType,
   MessageFlags,
 } = require('discord.js');
@@ -84,6 +85,7 @@ function buildV2Card({
   title,
   subtitle,
   sections = [],
+  fileAttachments = [],
   footer,
   notice,
   actionRows = [],
@@ -154,9 +156,12 @@ function buildV2Card({
   }
 
   const validRows = Array.isArray(actionRows) ? actionRows.filter(Boolean) : [];
+  const validFiles = (Array.isArray(fileAttachments) ? fileAttachments : [])
+    .map((name) => String(name || '').trim())
+    .filter(Boolean);
 
   // Si aucun bloc texte n'a ete fourni (ex: carte vide), assurer un contenu minimal valide
-  if (blocks.length === 0) {
+  if (blocks.length === 0 && validFiles.length === 0) {
     blocks.push({ kind: 'section', text: '—', dividerBefore: false });
   }
 
@@ -196,12 +201,32 @@ function buildV2Card({
 
   // Respect du plafond de 40 composants (container = 1)
   const rowComponentCount = countActionRowComponents(validRows);
-  const availableForTextAndSep = MAX_V2_COMPONENTS - 1 - rowComponentCount;
+  const availableForTextAndSep = MAX_V2_COMPONENTS - 1 - rowComponentCount - validFiles.length;
   const maxSeparators = Math.max(0, availableForTextAndSep - blocks.length);
   let usedSeparators = 0;
 
+  const hasFooterBlock = blocks.some((b) => b.kind === 'footer');
+  let filesInserted = false;
+
+  const insertFiles = () => {
+    if (filesInserted || validFiles.length === 0) return;
+    filesInserted = true;
+    for (const filename of validFiles) {
+      container.addFileComponents(new FileBuilder().setURL(`attachment://${filename}`));
+    }
+  };
+
   for (let i = 0; i < blocks.length; i += 1) {
     const b = blocks[i];
+    if (b.kind === 'footer' && !filesInserted && validFiles.length > 0) {
+      if (i > 0 && usedSeparators < maxSeparators) {
+        container.addSeparatorComponents(
+          new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small)
+        );
+        usedSeparators += 1;
+      }
+      insertFiles();
+    }
     if (i > 0 && b.dividerBefore && usedSeparators < maxSeparators) {
       container.addSeparatorComponents(
         new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small)
@@ -211,7 +236,16 @@ function buildV2Card({
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent(b.text));
   }
 
-  const hasFooterBlock = blocks.some((b) => b.kind === 'footer');
+  if (!filesInserted && validFiles.length > 0) {
+    if (blocks.length > 0 && usedSeparators < maxSeparators) {
+      container.addSeparatorComponents(
+        new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small)
+      );
+      usedSeparators += 1;
+    }
+    insertFiles();
+  }
+
   if (validRows.length > 0 && !hasFooterBlock && blocks.length > 0 && usedSeparators < maxSeparators) {
     container.addSeparatorComponents(
       new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small)
@@ -227,7 +261,7 @@ function buildV2Card({
 
 function buildV2Message(
   containers,
-  { ephemeral = false, allowedMentions, withComponents = false } = {}
+  { ephemeral = false, allowedMentions, withComponents = false, files } = {}
 ) {
   const list = (Array.isArray(containers) ? containers : [containers]).filter(Boolean);
   const payload = {
@@ -239,6 +273,9 @@ function buildV2Message(
   }
   if (withComponents) {
     payload.withComponents = true;
+  }
+  if (Array.isArray(files) && files.length > 0) {
+    payload.files = files;
   }
   return payload;
 }

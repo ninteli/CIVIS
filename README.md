@@ -15,6 +15,8 @@ Bot Discord d'administration de serveur propulsé par **IA locale (`llama.cpp`)*
 - **Suggestions proactives (`/suggestions`)** : analyse des *Audit Logs* Discord pour proposer des suites logiques après une modification du serveur.
 - **Journalisation chiffrée (`/logs`)** : envoi des actions dans un salon ou via webhook Discord (URLs chiffrées en AES-256-GCM).
 - **Clés API personnelles (`/apikey`)** : chaque utilisateur peut enregistrer sa propre clé API chiffrée en AES-256-GCM avec bascule automatique sur l'IA locale en cas d'erreur.
+- **Export & Import de configuration (`/export`, `/import`)** : export Markdown complet filtré selon les permissions du membre (avec guide JSON IA intégré) et import/pré-validation de scripts JSON jusqu'à 50 étapes avec résolution prioritaire par ID Snowflake.
+- **Protection Anti-Nuke, salons vitaux, arrêt d'urgence et rollback (300 s)** : détection des rafales et tentatives de raid (verrouillage temporaire 10 min et alerte `#logs`), protection des salons vitaux (règles, mises à jour, marqueurs de topic), bouton d'arrêt d'urgence et annulation des actions pendant 5 minutes.
 
 ## Prérequis
 
@@ -84,6 +86,8 @@ CIVIS/
 ├── stop.sh                     # Script d'arret
 ├── tests/                      # Suite de tests (node --test)
 └── src/
+    ├── version.js              # Gestion automatique des snapshots de version au demarrage
+    ├── version.json            # Metadonnees de la version snapshot actuelle (genere)
     ├── discord/
     │   ├── action-logs.js      # Journal des actions (/logs : salon ou webhook chiffre)
     │   ├── approvals.js        # Demandes de validation publique par boutons
@@ -92,9 +96,12 @@ CIVIS/
     │   ├── commands.js         # Slash commands
     │   ├── events.js           # Gestion des messages (mention) et de l'audit log
     │   ├── format.js           # Formatage des reponses
+    │   ├── plan-import.js      # Import/validation de scripts JSON externes (/import) et guide IA
     │   ├── plans.js            # Validation et execution en direct des plans multi-etapes
+    │   ├── server-export.js    # Export Markdown (.md) complet et filtre du serveur (/export)
     │   └── ui-v2.js            # Composants Discord Components V2
     └── agent/
+        ├── anti-nuke.js        # Protection anti-raid/anti-rafale et salons vitaux
         ├── brain.js            # Orchestration LLM + outils (modes chat / agent)
         ├── channel-types.js    # Types de salons Discord
         ├── colors.js           # Palette et resolution des couleurs de roles
@@ -104,6 +111,7 @@ CIVIS/
         ├── memory.js           # Memoire par salon
         ├── permissions.js      # Controle des permissions et hierarchie Discord
         ├── planner.js          # Planification multi-etapes et pre-validation serveur
+        ├── rate-limit.js       # Limitation de debit et concurrence par utilisateur
         ├── tool-executor.js    # Execution des outils sur Discord
         ├── tools.js            # Definitions des outils pour le LLM
         └── user-keys.js        # Stockage chiffre par utilisateur des cles API
@@ -111,13 +119,15 @@ CIVIS/
 
 ## Commandes Discord
 
-- `/ping` : Test basique
+- `/ping` : Test basique (latence et version snapshot actuelle)
 - `/ask question:<texte>` : Poser une question (mode conversation + lecture)
 - `/agent demande:<texte>` : Action unitaire (créer/modifier/archiver/supprimer salons, catégories ou rôles, gérer les permissions)
 - `/plan demande:<texte>` : Configuration multi-étapes du serveur (aperçu, modification, validation puis exécution en direct)
 - `/apikey set|model|test|status|clear` : Gérer sa clé API personnelle (réponses éphémères)
 - `/logs set|webhook|status|test|off` : Journal des actions de CIVIS dans un salon ou via webhook
-- `/suggestions on|off|set|auto|cooldown|status` : Suggestions proactives de plans après modification du serveur
+- `/suggestions on|off|set|cooldown|status` : Suggestions proactives de plans après modification du serveur (désactivées par défaut, nécessitent un salon configuré)
+- `/export [public] [guide_ia]` : Exporte en fichier Markdown (`.md`) toutes les informations accessibles du serveur (filtré selon les permissions du membre ; option `public` réservée à `ManageGuild`) + guide JSON pour IA externe
+- `/import [fichier] [json]` : Importe et pré-valide un script JSON de modifications (jusqu'à 50 étapes, généré par Gemini ou une autre IA) avec aperçu interactif par boutons et exécution en direct
 - `/debugmod` : Active/désactive le mode debug
 - `@CIVIS <message>` : Conversation par mention (seule la vraie mention `@` déclenche le bot)
 
@@ -127,9 +137,11 @@ CIVIS/
 
 ## Sécurité et clé maître de chiffrement
 
-La clé maître qui chiffre `data/user-keys.json` et les webhooks de `data/guild-logs.json` (AES-256-GCM) est stockée **hors du dossier `data/`**, afin qu'une sauvegarde ou fuite de `data/` ne suffise pas à déchiffrer les secrets.
+La clé maître qui chiffre `data/user-keys.json` et les webhooks de `data/guild-logs.json` (AES-256-GCM authentifié avec AAD) est stockée **hors du dossier `data/`**, afin qu'une sauvegarde ou fuite de `data/` ne suffise pas à déchiffrer les secrets.
 
-Ordre de résolution :
+Le serveur `llama-server` local est également protégé par `LLM_API_KEY` (`Authorization: Bearer`), généré automatiquement par `start.sh` dans `.env` si absent.
+
+Ordre de résolution de la clé maître :
 1. Variable d'environnement `KEY_ENCRYPTION_SECRET` (dérivée par `scrypt`) : recommandé en déploiement serveur / systemd.
 2. Fichier pointé par `CIVIS_MASTER_KEY_FILE`.
 3. Par défaut : `~/.config/civis/master.key` (dossier `0700`, fichier `0600`, créé automatiquement).
@@ -141,6 +153,10 @@ Consultez [SECURITY.md](SECURITY.md) pour signaler une vulnérabilité.
 ```bash
 npm test
 ```
+
+## Versioning automatique (Snapshots)
+
+À chaque redémarrage (`index.js` ou `npm run snapshot`), CIVIS calcule l'empreinte SHA-256 du code source (`src/`, fichiers `.js`/`.sh` racine et `package.json` hors champ `version`). En cas de modification, il incrémente automatiquement la version au format `<base>-snapshot.YYYYMMDD.<N>` dans `package.json` et `src/version.json`, puis l'affiche en statut Discord personnalisé (`v<version>`).
 
 ## Contribuer
 

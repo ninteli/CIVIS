@@ -55,6 +55,47 @@ function buildSystemPrompt(mode) {
   );
 }
 
+function extractJsonObjectCandidates(text) {
+  const candidates = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === '}' && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        candidates.push({ json: text.slice(start, i + 1), end: i });
+        start = -1;
+      }
+    }
+  }
+
+  return candidates;
+}
+
 function tryParseToolCall(text) {
   if (typeof text !== 'string') return null;
 
@@ -66,39 +107,79 @@ function tryParseToolCall(text) {
     .replace(/\s*```$/i, '')
     .trim();
 
-  const jsonStart = cleaned.indexOf('{');
-  const jsonEnd = cleaned.lastIndexOf('}');
-  if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) return null;
+  const candidates = extractJsonObjectCandidates(cleaned);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate.json);
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        Array.isArray(parsed) ||
+        typeof parsed.tool !== 'string'
+      ) {
+        continue;
+      }
 
-  const jsonPart = cleaned.substring(jsonStart, jsonEnd + 1);
+      const toolName = parsed.tool.trim().toLowerCase();
 
-  try {
-    const parsed = JSON.parse(jsonPart);
-    if (
-      !parsed ||
-      typeof parsed !== 'object' ||
-      Array.isArray(parsed) ||
-      typeof parsed.tool !== 'string'
-    ) {
-      return null;
+      if (toolName === 'aucun' || toolName === 'none' || toolName === 'null' || toolName === '') {
+        const textPart = cleaned.substring(candidate.end + 1).trim();
+        return { __chatText: textPart || cleaned };
+      }
+
+      const args =
+        parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
+          ? parsed.args
+          : {};
+
+      return { tool: parsed.tool.trim(), args };
+    } catch {
+      // Ignore invalid JSON candidate and try the next one
     }
+  }
 
-    const toolName = parsed.tool.trim().toLowerCase();
+  return null;
+}
 
-    if (toolName === 'aucun' || toolName === 'none' || toolName === 'null' || toolName === '') {
-      const textPart = cleaned.substring(jsonEnd + 1).trim();
-      return { __chatText: textPart || cleaned };
-    }
+const MUTATION_INTENT_RE =
+  /\b(cree|creer|crees|ajoute|ajouter|supprime|supprimer|efface|effacer|archive|archiver|modifie|modifier|renomme|renommer|change|changer|permission|permissions|droit|droits)\b/;
+const LIST_QUERY_RE =
+  /\b(liste|lister|affiche|afficher|montre|montrer|voir|donne|donner|quels?\s+sont|c\s*est\s+quoi|y\s+a\s*t\s*il|combien)\b/;
 
-    const args =
-      parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
-        ? parsed.args
-        : {};
+function detectReadToolIntent(userText) {
+  if (typeof userText !== 'string') return null;
+  const normalized = userText
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/['’]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
-    return { tool: parsed.tool.trim(), args };
-  } catch {
+  if (!normalized || MUTATION_INTENT_RE.test(normalized)) {
     return null;
   }
+
+  const wantsChannels = /\b(salons?|channels?|canaux)\b/.test(normalized);
+  const wantsRoles = /\b(roles?|grades?)\b/.test(normalized);
+  const isBareList = /^(les\s+)?(salons?|channels?|canaux|roles?|grades?)\s*\??$/.test(normalized);
+
+  if (wantsChannels && !wantsRoles && (LIST_QUERY_RE.test(normalized) || isBareList)) {
+    return 'list_channels';
+  }
+  if (wantsRoles && !wantsChannels && (LIST_QUERY_RE.test(normalized) || isBareList)) {
+    return 'list_roles';
+  }
+
+  return null;
+}
+
+function buildFollowupSystemPrompt() {
+  return (
+    config.systemPrompt +
+    '\n\nReponds en francais de maniere naturelle, fidele et concise a partir du resultat fourni. ' +
+    'Ne reponds JAMAIS en JSON et ne mentionne pas le nom de l outil.'
+  );
 }
 
 function resolveEffectiveUserConfig(authorId, explicitUserConfig) {
@@ -235,21 +316,31 @@ async function processMessage({
     }
   } else {
     if (toolCall && toolCall.__chatText) {
-      recordMessage({ role: 'assistant', content: toolCall.__chatText });
-      return {
-        content: toolCall.__chatText,
-        stats: { ...lastStats, elapsedMs: totalElapsedMs },
-        usedTool: null,
-      };
+      const recovered = detectReadToolIntent(userText);
+      if (recovered) {
+        toolCall = { tool: recovered, args: {} };
+      } else {
+        recordMessage({ role: 'assistant', content: toolCall.__chatText });
+        return {
+          content: toolCall.__chatText,
+          stats: { ...lastStats, elapsedMs: totalElapsedMs },
+          usedTool: null,
+        };
+      }
     }
 
     if (!toolCall) {
-      recordMessage({ role: 'assistant', content: first.content });
-      return {
-        content: first.content,
-        stats: { ...lastStats, elapsedMs: totalElapsedMs },
-        usedTool: null,
-      };
+      const recovered = detectReadToolIntent(userText);
+      if (recovered) {
+        toolCall = { tool: recovered, args: {} };
+      } else {
+        recordMessage({ role: 'assistant', content: first.content });
+        return {
+          content: first.content,
+          stats: { ...lastStats, elapsedMs: totalElapsedMs },
+          usedTool: null,
+        };
+      }
     }
   }
 
@@ -344,9 +435,12 @@ async function processMessage({
   const followupInstruction =
     toolCall.tool === 'search_app_directory'
       ? '\n\nMaintenant, reponds a l utilisateur en francais de maniere claire et concise en conservant les noms exacts des bots/applications, leurs descriptions courtes et leurs liens App Directory.'
-      : '\n\nMaintenant, reponds a l utilisateur en francais, de maniere naturelle et concise. Ne mentionne PAS l outil ni l execution.';
+      : '\n\nMaintenant, reponds a l utilisateur en francais, de maniere naturelle et concise en listant exactement les elements ci-dessus. Ne reponds PAS en JSON et ne mentionne PAS l outil.';
 
-  const followupMessages = messages.concat([
+  const followupHistory = messages.filter((m) => m.role !== 'system');
+  const followupMessages = [
+    { role: 'system', content: buildFollowupSystemPrompt() },
+    ...followupHistory,
     {
       role: 'user',
       content:
@@ -356,7 +450,7 @@ async function processMessage({
         execution.result +
         followupInstruction,
     },
-  ]);
+  ];
 
   const second = await callLLM(followupMessages, {
     maxTokens: chatMaxTokens,
@@ -365,10 +459,15 @@ async function processMessage({
   });
   totalElapsedMs += second.stats?.elapsedMs || 0;
 
-  memory.addMessage(channelId, { role: 'assistant', content: second.content });
+  const finalContent =
+    !second.content || !String(second.content).trim() || tryParseToolCall(second.content)
+      ? execution.result
+      : second.content;
+
+  memory.addMessage(channelId, { role: 'assistant', content: finalContent });
 
   return {
-    content: second.content,
+    content: finalContent,
     stats: mergeFollowupStats(lastStats, second.stats, totalElapsedMs),
     usedTool: toolCall.tool,
     toolArgs: toolCall.args,
@@ -406,6 +505,7 @@ async function warmupLocalLLM() {
 module.exports = {
   processMessage,
   tryParseToolCall,
+  detectReadToolIntent,
   buildSystemPrompt,
   warmupLocalLLM,
   resolveEffectiveUserConfig,

@@ -168,13 +168,21 @@ function createGuildLogStore(dataDir = DEFAULT_DATA_DIR, options = {}) {
     return cachedMasterKey;
   }
 
-  function encryptSecret(plainText) {
+  function buildWebhookAad(guildId) {
+    return Buffer.from('civis-guild-log-v2:' + String(guildId || ''), 'utf8');
+  }
+
+  function encryptSecret(plainText, aad = null) {
     const key = getMasterKey();
     const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
+    if (aad) {
+      cipher.setAAD(aad);
+    }
     const encrypted = Buffer.concat([cipher.update(String(plainText), 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return {
+      v: aad ? 2 : 1,
       alg: 'aes-256-gcm',
       iv: iv.toString('base64'),
       tag: tag.toString('base64'),
@@ -182,17 +190,24 @@ function createGuildLogStore(dataDir = DEFAULT_DATA_DIR, options = {}) {
     };
   }
 
-  function decryptSecret(payload) {
+  function decryptSecret(payload, aad = null) {
     if (!payload || payload.alg !== 'aes-256-gcm' || !payload.iv || !payload.tag || !payload.data) {
       return null;
     }
+    const ivBuf = Buffer.from(payload.iv, 'base64');
+    const tagBuf = Buffer.from(payload.tag, 'base64');
+    if (ivBuf.length !== 12 || tagBuf.length !== 16) {
+      return null;
+    }
     const key = getMasterKey();
-    const decipher = crypto.createDecipheriv(
-      'aes-256-gcm',
-      key,
-      Buffer.from(payload.iv, 'base64')
-    );
-    decipher.setAuthTag(Buffer.from(payload.tag, 'base64'));
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, ivBuf, {
+      authTagLength: 16,
+    });
+    if (payload.v === 2) {
+      if (!aad) return null;
+      decipher.setAAD(aad);
+    }
+    decipher.setAuthTag(tagBuf);
     const decrypted = Buffer.concat([
       decipher.update(Buffer.from(payload.data, 'base64')),
       decipher.final(),
@@ -250,7 +265,7 @@ function createGuildLogStore(dataDir = DEFAULT_DATA_DIR, options = {}) {
       enabled: true,
       mode: 'webhook',
       channelId: null,
-      webhookUrlEnc: encryptSecret(validation.url),
+      webhookUrlEnc: encryptSecret(validation.url, buildWebhookAad(guildId)),
       updatedBy: userId ? String(userId) : null,
       updatedAt: new Date().toISOString(),
     };
@@ -301,7 +316,7 @@ function createGuildLogStore(dataDir = DEFAULT_DATA_DIR, options = {}) {
     let decryptError = false;
     if (raw.webhookUrlEnc) {
       try {
-        webhookUrl = decryptSecret(raw.webhookUrlEnc);
+        webhookUrl = decryptSecret(raw.webhookUrlEnc, buildWebhookAad(guildId));
       } catch {
         webhookUrl = null;
         decryptError = true;
@@ -510,7 +525,13 @@ function isMissingWebhookError(err) {
   return err.code === 10015 || err.status === 404 || Number(err?.rawError?.code) === 10015;
 }
 
-async function sendViaWebhookClient(url, containers, client, webhookClientFactory) {
+async function sendViaWebhookClient(
+  url,
+  containers,
+  client,
+  webhookClientFactory,
+  allowedMentions = { parse: [] }
+) {
   const factory = webhookClientFactory || ((targetUrl) => new WebhookClient({ url: targetUrl }));
   const whClient = factory(url);
   const avatarURL =
@@ -521,7 +542,7 @@ async function sendViaWebhookClient(url, containers, client, webhookClientFactor
       const payload = {
         username: LOG_WEBHOOK_NAME,
         ...buildV2Message(container, {
-          allowedMentions: { parse: [] },
+          allowedMentions,
           withComponents: true,
         }),
         ...(avatarURL ? { avatarURL } : {}),
@@ -544,6 +565,7 @@ async function sendLogEmbeds({
   client = null,
   embeds,
   components,
+  allowedMentions = { parse: [] },
   store = defaultStore,
   webhookClientFactory = null,
 }) {
@@ -567,7 +589,13 @@ async function sendLogEmbeds({
       if (!validation.ok) {
         return { ok: false, skipped: true, reason: 'invalid_webhook_url' };
       }
-      await sendViaWebhookClient(validation.url, list, client, webhookClientFactory);
+      await sendViaWebhookClient(
+        validation.url,
+        list,
+        client,
+        webhookClientFactory,
+        allowedMentions
+      );
       return { ok: true, delivery: 'custom_webhook' };
     }
 
@@ -587,7 +615,13 @@ async function sendLogEmbeds({
     let webhookDesc = await getOrCreateChannelWebhook(targetChannel, client);
     if (webhookDesc) {
       try {
-        await sendViaWebhookClient(webhookDesc.url, list, client, webhookClientFactory);
+        await sendViaWebhookClient(
+          webhookDesc.url,
+          list,
+          client,
+          webhookClientFactory,
+          allowedMentions
+        );
         return { ok: true, delivery: 'channel_webhook', channelId: targetChannel.id };
       } catch (err) {
         if (isMissingWebhookError(err)) {
@@ -595,7 +629,13 @@ async function sendLogEmbeds({
           webhookDesc = await getOrCreateChannelWebhook(targetChannel, client);
           if (webhookDesc) {
             try {
-              await sendViaWebhookClient(webhookDesc.url, list, client, webhookClientFactory);
+              await sendViaWebhookClient(
+                webhookDesc.url,
+                list,
+                client,
+                webhookClientFactory,
+                allowedMentions
+              );
               return { ok: true, delivery: 'channel_webhook_recreated', channelId: targetChannel.id };
             } catch {
               // Fall through to channel.send fallback.
@@ -607,9 +647,7 @@ async function sendLogEmbeds({
 
     if (typeof targetChannel.send === 'function' && hasBotSendPermission(targetChannel, client)) {
       for (const container of list) {
-        await targetChannel.send(
-          buildV2Message(container, { allowedMentions: { parse: [] } })
-        );
+        await targetChannel.send(buildV2Message(container, { allowedMentions }));
       }
       return { ok: true, delivery: 'channel_send_fallback', channelId: targetChannel.id };
     }
@@ -987,6 +1025,56 @@ async function sendTestLog({
   });
 }
 
+async function logSecurityAlert({
+  guild,
+  client = null,
+  actorId = null,
+  channelId = null,
+  title = '🚨 Alerte Securite Anti-Nuke',
+  reason = 'Activite suspecte bloquee.',
+  details = null,
+  lockedMinutes = null,
+  store = defaultStore,
+  webhookClientFactory = null,
+}) {
+  const ownerId = guild?.ownerId || null;
+  const ownerMention = ownerId ? `<@${ownerId}>` : '*(proprietaire inconnu)*';
+
+  const metaLines = [
+    `• **Proprietaire alerte** : ${ownerMention}`,
+    `• **Utilisateur concerne** : ${actorId ? `<@${actorId}> (\`${actorId}\`)` : 'Inconnu'}`,
+    `• **Salon d'origine** : ${channelId ? `<#${channelId}>` : 'Inconnu'}`,
+  ];
+  if (lockedMinutes) {
+    metaLines.push(`• **Sanction automatique** : Blocage de toute intervention CIVIS pendant \`${lockedMinutes} min\``);
+  }
+
+  const sections = [
+    `${ownerMention} — Une tentative suspecte de raid / modification massive a ete bloquee par l'anti-nuke.`,
+    metaLines.join('\n'),
+    { heading: '🛡️ Motif du blocage', body: truncate(reason, 900) },
+  ];
+  if (details) {
+    sections.push({ heading: '📋 Details', body: truncate(details, 900) });
+  }
+
+  const card = buildV2Card({
+    color: COLORS.DANGER,
+    title: truncate(title, 256),
+    sections,
+    footer: `🦊 CIVIS • Anti-Nuke • ${formatDiscordTimestamp(Date.now(), 't')}`,
+  });
+
+  return sendLogEmbeds({
+    guild,
+    client,
+    components: [card],
+    allowedMentions: ownerId ? { users: [ownerId] } : { parse: [] },
+    store,
+    webhookClientFactory,
+  });
+}
+
 module.exports = {
   DISCORD_WEBHOOK_RE,
   LOG_CHANNEL_CANDIDATES,
@@ -1012,5 +1100,6 @@ module.exports = {
   buildPlanLogContainers: buildPlanLogEmbeds,
   logAction,
   logPlanExecution,
+  logSecurityAlert,
   sendTestLog,
 };

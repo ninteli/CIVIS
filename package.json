@@ -1,11 +1,12 @@
 {
   "name": "ninteli-ai",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CIVIS — Bot Discord d'administration de serveur propulse par IA locale (llama.cpp) et APIs externes avec validation par boutons et journalisation chiffree.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "snapshot": "node src/version.js"
   },
   "keywords": [
     "discord",

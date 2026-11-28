@@ -7,6 +7,7 @@ const {
 const { resolveColor, findExplicitColorInText } = require('./colors');
 const {
   normalizeKey,
+  extractSnowflakeId,
   isManagedChannelType,
   supportsTextProperties,
   isVoiceLikeChannelType,
@@ -23,6 +24,8 @@ const {
   checkBotPermissions,
   checkMemberAuthorization,
 } = require('./permissions');
+const antiNuke = require('./anti-nuke');
+const actionLogs = require('../discord/action-logs');
 
 const DELETE_CONFIRM_TIMEOUT_MS = 30_000;
 const ARCHIVED_ROLE_PREFIX = '[Archivé] ';
@@ -32,6 +35,10 @@ const normalizeText = normalizeKey;
 function findRoleByName(guild, roleName) {
   const clean = String(roleName || '').trim();
   if (!clean || !guild?.roles?.cache) return null;
+  const roleId = extractSnowflakeId(clean);
+  if (roleId) {
+    return guild.roles.cache.get(roleId) || null;
+  }
   const lower = clean.toLowerCase();
   const normalized = normalizeText(clean);
   return (
@@ -44,6 +51,11 @@ function findRoleByName(guild, roleName) {
 function findManagedChannelByName(guild, channelName) {
   const clean = String(channelName || '').trim().replace(/^#/, '');
   if (!clean || !guild?.channels?.cache) return null;
+  const channelId = extractSnowflakeId(clean);
+  if (channelId) {
+    const byId = guild.channels.cache.get(channelId);
+    return byId && isManagedChannelType(byId.type) ? byId : null;
+  }
   const lower = clean.toLowerCase();
   const sanitized = sanitizeChannelName(clean);
   const normalized = normalizeText(clean);
@@ -70,6 +82,18 @@ function sanitizeChannelName(raw) {
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
+    .slice(0, 100);
+}
+
+function formatTextChannelName(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/^#+/, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .toLowerCase()
     .slice(0, 100);
 }
 
@@ -212,9 +236,10 @@ function canMemberViewChannel(channel, member, guild) {
   }
   if (typeof channel?.permissionsFor === 'function') {
     const perms = channel.permissionsFor(member);
-    if (perms && typeof perms.has === 'function') {
-      return perms.has(PermissionsBitField.Flags.ViewChannel);
+    if (!perms || typeof perms.has !== 'function') {
+      return false;
     }
+    return perms.has(PermissionsBitField.Flags.ViewChannel);
   }
   return true;
 }
@@ -281,17 +306,26 @@ async function createChannel(args, guild, member, { mode, userText }) {
   const typeLabel = typeRes.label;
   const cleanName = isVoiceLikeChannelType(channelType)
     ? rawName.replace(/^#/, '').trim().slice(0, 100)
-    : sanitizeChannelName(rawName);
+    : formatTextChannelName(rawName);
   if (!cleanName) {
     return { ok: false, error: 'Le nom du salon est invalide.' };
   }
 
   let parentId = null;
   if (args.category && String(args.category).trim()) {
+    const explicitCatId = extractSnowflakeId(args.category);
     const explicitCat = findCategoryByName(guild, args.category);
-    parentId = explicitCat ? explicitCat.id : findCategoryId(guild, args.category_hint, cleanName);
+    if (explicitCat && !canMemberViewChannel(explicitCat, member, guild)) {
+      return { ok: false, error: 'Categorie introuvable.' };
+    }
+    if (explicitCatId && !explicitCat) {
+      return { ok: false, error: 'Categorie introuvable (ID : ' + explicitCatId + ').' };
+    }
+    parentId = explicitCat
+      ? explicitCat.id
+      : findCategoryId(guild, args.category_hint, cleanName, member);
   } else {
-    parentId = findCategoryId(guild, args.category_hint, cleanName);
+    parentId = findCategoryId(guild, args.category_hint, cleanName, member);
   }
   const parentChannel = parentId ? guild.channels.cache.get(parentId) || null : null;
 
@@ -398,6 +432,12 @@ async function createChannel(args, guild, member, { mode, userText }) {
 
   return {
     ok: true,
+    createdChannelId: channel.id,
+    undo: {
+      kind: 'delete_channel',
+      channelId: channel.id,
+      label: `Supprimer le salon cree #${channel.name}`,
+    },
     result:
       'Salon cree avec succes.\n' +
       'Nom : #' + channel.name + '\n' +
@@ -457,6 +497,12 @@ async function createRole(args, guild, member, { mode, userText }) {
 
   return {
     ok: true,
+    createdRoleId: role.id,
+    undo: {
+      kind: 'delete_role',
+      roleId: role.id,
+      label: `Supprimer le role cree "${role.name}"`,
+    },
     result:
       'Role cree avec succes.\n' +
       'Nom : ' + role.name + '\n' +
@@ -472,8 +518,17 @@ async function modifyChannel(args, guild, member, { mode, userText }) {
   }
 
   const channel = findManagedChannelByName(guild, channelName);
-  if (!channel) {
+  if (!channel || !canMemberViewChannel(channel, member, guild)) {
     return { ok: false, error: 'Salon introuvable : #' + channelName };
+  }
+
+  const protection = antiNuke.checkProtectedChannel(channel, guild, { actionLogs, member });
+  if (protection.protected) {
+    return {
+      ok: false,
+      protectedChannel: true,
+      error: '🛡️ Modification interdite : ' + protection.reason,
+    };
   }
 
   const updates = {};
@@ -482,7 +537,7 @@ async function modifyChannel(args, guild, member, { mode, userText }) {
   if (args.new_name) {
     const cleanName = isVoiceLikeChannelType(channel.type)
       ? String(args.new_name).replace(/^#/, '').trim().slice(0, 100)
-      : sanitizeChannelName(args.new_name);
+      : formatTextChannelName(args.new_name);
     if (cleanName) {
       updates.name = cleanName;
       summaryLines.push('Nouveau nom : #' + cleanName);
@@ -512,7 +567,7 @@ async function modifyChannel(args, guild, member, { mode, userText }) {
 
   if (args.category !== undefined && String(args.category).trim() !== '') {
     const targetCat = findCategoryByName(guild, args.category);
-    if (!targetCat) {
+    if (!targetCat || !canMemberViewChannel(targetCat, member, guild)) {
       return { ok: false, error: 'Categorie introuvable : ' + args.category };
     }
     updates.parent = targetCat.id;
@@ -574,10 +629,25 @@ async function modifyChannel(args, guild, member, { mode, userText }) {
   });
   if (!auth.ok) return auth;
 
+  const prevState = {};
+  if (updates.name !== undefined) prevState.name = channel.name;
+  if (updates.type !== undefined) prevState.type = channel.type;
+  if (updates.parent !== undefined) prevState.parent = channel.parentId ?? null;
+  if (updates.rateLimitPerUser !== undefined) prevState.rateLimitPerUser = channel.rateLimitPerUser ?? 0;
+  if (updates.nsfw !== undefined) prevState.nsfw = Boolean(channel.nsfw);
+  if (updates.flags !== undefined) prevState.flags = channel.flags ? channel.flags.bitfield ?? channel.flags : 0;
+  if (updates.topic !== undefined) prevState.topic = channel.topic ?? null;
+
   await channel.edit(updates);
 
   return {
     ok: true,
+    undo: {
+      kind: 'restore_channel',
+      channelId: channel.id,
+      prevState,
+      label: `Restaurer le salon #${prevState.name || channel.name}`,
+    },
     result:
       'Salon #' +
       channel.name +
@@ -647,10 +717,22 @@ async function modifyRoleDisplay(args, guild, member, { mode, userText }) {
   });
   if (!auth.ok) return auth;
 
+  const prevState = {};
+  if (updates.name !== undefined) prevState.name = role.name;
+  if (updates.colors !== undefined) prevState.colors = { primaryColor: role.color ?? 0 };
+  if (updates.hoist !== undefined) prevState.hoist = Boolean(role.hoist);
+  if (updates.mentionable !== undefined) prevState.mentionable = Boolean(role.mentionable);
+
   await role.edit(updates);
 
   return {
     ok: true,
+    undo: {
+      kind: 'restore_role',
+      roleId: role.id,
+      prevState,
+      label: `Restaurer l apparence du role "${prevState.name || role.name}"`,
+    },
     result:
       'Role "' +
       role.name +
@@ -701,6 +783,7 @@ async function modifyRolePerm(args, guild, member, { mode, userText }) {
   });
   if (!auth.ok) return auth;
 
+  const prevPermissions = new PermissionsBitField(role.permissions).bitfield;
   const nextPermissions = new PermissionsBitField(role.permissions);
   if (addFlags.length) nextPermissions.add(addFlags);
   if (removeFlags.length) nextPermissions.remove(removeFlags);
@@ -713,6 +796,12 @@ async function modifyRolePerm(args, guild, member, { mode, userText }) {
 
   return {
     ok: true,
+    undo: {
+      kind: 'restore_role',
+      roleId: role.id,
+      prevState: { permissions: prevPermissions },
+      label: `Restaurer les permissions du role "${role.name}"`,
+    },
     result: 'Permissions du role "' + role.name + '" modifiees.\n' + changes.join('\n'),
   };
 }
@@ -725,8 +814,17 @@ async function deleteChannel(args, guild, member, { mode, userText, confirmed = 
 
   const channel = findManagedChannelByName(guild, channelName);
 
-  if (!channel) {
+  if (!channel || !canMemberViewChannel(channel, member, guild)) {
     return { ok: false, error: 'Salon introuvable : #' + channelName };
+  }
+
+  const protection = antiNuke.checkProtectedChannel(channel, guild, { actionLogs, member });
+  if (protection.protected) {
+    return {
+      ok: false,
+      protectedChannel: true,
+      error: '🛡️ Suppression interdite : ' + protection.reason,
+    };
   }
 
   const botCheck = checkBotPermissions({
@@ -805,12 +903,33 @@ async function deleteChannel(args, guild, member, { mode, userText, confirmed = 
 
   const deletedName = channel.name;
   const deletedId = channel.id;
+  const deletedSnapshot = {
+    name: channel.name,
+    type: channel.type,
+    parent: channel.parentId ?? null,
+    topic: channel.topic ?? undefined,
+    nsfw: Boolean(channel.nsfw),
+    rateLimitPerUser: channel.rateLimitPerUser ?? 0,
+    permissionOverwrites: channel.permissionOverwrites?.cache
+      ? Array.from(channel.permissionOverwrites.cache.values()).map((ow) => ({
+          id: ow.id,
+          type: ow.type,
+          allow: ow.allow?.bitfield ?? 0n,
+          deny: ow.deny?.bitfield ?? 0n,
+        }))
+      : [],
+  };
   await channel.delete('Suppression confirmee via CIVIS');
 
   return {
     ok: true,
     result: 'Salon #' + deletedName + ' supprime avec succes.',
     deletedChannelId: deletedId,
+    undo: {
+      kind: 'recreate_channel',
+      snapshot: deletedSnapshot,
+      label: `Recreer le salon supprime #${deletedName}`,
+    },
   };
 }
 
@@ -899,11 +1018,23 @@ async function deleteRole(args, guild, member, { mode, userText, confirmed = fal
   }
 
   const deletedName = role.name;
+  const deletedRoleSnapshot = {
+    name: role.name,
+    colors: role.color ? { primaryColor: role.color } : undefined,
+    hoist: Boolean(role.hoist),
+    mentionable: Boolean(role.mentionable),
+    permissions: role.permissions ? new PermissionsBitField(role.permissions).bitfield : 0n,
+  };
   await role.delete('Suppression confirmee via CIVIS');
 
   return {
     ok: true,
     result: 'Role "' + deletedName + '" supprime avec succes.',
+    undo: {
+      kind: 'recreate_role',
+      snapshot: deletedRoleSnapshot,
+      label: `Recreer le role supprime "${deletedName}"`,
+    },
   };
 }
 
@@ -915,8 +1046,17 @@ async function archiveChannelTool(args, guild, member, { mode, userText }) {
 
   const channel = findManagedChannelByName(guild, channelName);
 
-  if (!channel) {
+  if (!channel || !canMemberViewChannel(channel, member, guild)) {
     return { ok: false, error: 'Salon introuvable : #' + channelName };
+  }
+
+  const protection = antiNuke.checkProtectedChannel(channel, guild, { actionLogs, member });
+  if (protection.protected) {
+    return {
+      ok: false,
+      protectedChannel: true,
+      error: '🛡️ Archivage interdit : ' + protection.reason,
+    };
   }
 
   const auth = authorizeAction({
@@ -1022,6 +1162,16 @@ async function archiveChannel(guild, channelId) {
     archiveCategory = await guild.channels.create(catOptions);
   }
 
+  const prevParentId = channel.parentId ?? null;
+  const prevOverwrites = channel.permissionOverwrites?.cache
+    ? Array.from(channel.permissionOverwrites.cache.values()).map((ow) => ({
+        id: ow.id,
+        type: ow.type,
+        allow: ow.allow?.bitfield ?? 0n,
+        deny: ow.deny?.bitfield ?? 0n,
+      }))
+    : null;
+
   const editPayload = { parent: archiveCategory.id };
   if (canEditOverwrites) {
     editPayload.permissionOverwrites = hiddenOverwrites;
@@ -1032,6 +1182,15 @@ async function archiveChannel(guild, channelId) {
     ok: true,
     hidden: canEditOverwrites,
     categoryName: archiveCategory.name,
+    undo: {
+      kind: 'restore_channel',
+      channelId: channel.id,
+      prevState: {
+        parent: prevParentId,
+        ...(canEditOverwrites && prevOverwrites ? { permissionOverwrites: prevOverwrites } : {}),
+      },
+      label: `Desarchiver le salon #${channel.name}`,
+    },
     result: canEditOverwrites
       ? 'Salon #' +
         channel.name +
@@ -1089,6 +1248,13 @@ async function archiveRole(guild, roleId) {
     }
   }
 
+  const prevRoleState = {
+    name: role.name,
+    permissions: role.permissions ? new PermissionsBitField(role.permissions).bitfield : 0n,
+    hoist: Boolean(role.hoist),
+    mentionable: Boolean(role.mentionable),
+  };
+
   await role.edit({
     name: archivedName,
     permissions: nextPermissions,
@@ -1100,6 +1266,12 @@ async function archiveRole(guild, roleId) {
     ok: true,
     archivedName,
     unremovablePerms,
+    undo: {
+      kind: 'restore_role',
+      roleId: role.id,
+      prevState: prevRoleState,
+      label: `Desarchiver le role "${prevRoleState.name}"`,
+    },
     result:
       unremovablePerms.length > 0
         ? 'Role mis en quarantaine sous "' +
@@ -1155,6 +1327,11 @@ async function createCategory(args, guild, member, { mode, userText }) {
   return {
     ok: true,
     categoryId: cat.id,
+    undo: {
+      kind: 'delete_channel',
+      channelId: cat.id,
+      label: `Supprimer la categorie creee "${cat.name}"`,
+    },
     result: 'Categorie "' + cat.name + '" creee avec succes.',
   };
 }
@@ -1198,17 +1375,28 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
     }
   }
 
-  const sanitized = sanitizeChannelName(channelName);
-  const normalizedTarget = normalizeText(channelName);
-  const matchesTargetName = (c) =>
-    c.name.toLowerCase() === channelName.toLowerCase() ||
-    (sanitized && c.name.toLowerCase() === sanitized) ||
-    normalizeText(c.name) === normalizedTarget;
+  const targetId = extractSnowflakeId(rawChannelVal);
+  let matchedCategory = null;
+  let matchedChannel = null;
+  if (targetId) {
+    const byId = guild.channels.cache.get(targetId);
+    if (byId) {
+      if (byId.type === ChannelType.GuildCategory) matchedCategory = byId;
+      else if (isManagedChannelType(byId.type)) matchedChannel = byId;
+    }
+  } else {
+    const sanitized = sanitizeChannelName(channelName);
+    const normalizedTarget = normalizeText(channelName);
+    const matchesTargetName = (c) =>
+      c.name.toLowerCase() === channelName.toLowerCase() ||
+      (sanitized && c.name.toLowerCase() === sanitized) ||
+      normalizeText(c.name) === normalizedTarget;
 
-  const matchedCategory = guild.channels.cache.find(
-    (c) => c.type === ChannelType.GuildCategory && matchesTargetName(c)
-  );
-  const matchedChannel = findManagedChannelByName(guild, channelName);
+    matchedCategory = guild.channels.cache.find(
+      (c) => c.type === ChannelType.GuildCategory && matchesTargetName(c)
+    );
+    matchedChannel = findManagedChannelByName(guild, channelName);
+  }
 
   let channel = null;
   if (targetType === 'category') {
@@ -1235,7 +1423,7 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
     channel = matchedCategory || matchedChannel || null;
   }
 
-  if (!channel) {
+  if (!channel || !canMemberViewChannel(channel, member, guild)) {
     return { ok: false, error: 'Salon ou categorie introuvable : ' + channelName };
   }
 
@@ -1245,10 +1433,15 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
   }
 
   const normalizedRole = normalizeText(roleName);
+  const roleSnowflake = extractSnowflakeId(roleName);
   let targetRole = null;
   let targetRoleId;
   let roleLabel;
-  if (normalizedRole === '@everyone' || normalizedRole === 'everyone') {
+  if (
+    normalizedRole === '@everyone' ||
+    normalizedRole === 'everyone' ||
+    (roleSnowflake && roleSnowflake === guild.id)
+  ) {
     targetRoleId = guild.id;
     roleLabel = '@everyone';
   } else {
@@ -1274,6 +1467,16 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
   }
 
   const isCategory = channel.type === ChannelType.GuildCategory;
+  if (!isCategory) {
+    const protection = antiNuke.checkProtectedChannel(channel, guild, { actionLogs, member });
+    if (protection.protected) {
+      return {
+        ok: false,
+        protectedChannel: true,
+        error: '🛡️ Modification de permissions interdite : ' + protection.reason,
+      };
+    }
+  }
   const syncChildren = isCategory && args.sync_children !== false;
   const childChannels = isCategory
     ? Array.from(guild.channels.cache.values()).filter(
@@ -1300,9 +1503,9 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
 
   const normalizedArgs = {
     ...args,
-    channel: channel.name,
+    channel: targetId ? channel.id : channel.name,
     target_type: isCategory ? 'category' : 'channel',
-    role: roleLabel,
+    role: roleSnowflake && targetRoleId !== guild.id ? targetRoleId : roleLabel,
   };
   delete normalizedArgs.category;
 
@@ -1336,6 +1539,20 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
       !me.permissions.has(PermissionsBitField.Flags.Administrator)
   );
 
+  const captureOverwrite = (targetChan) => {
+    const existingOw = targetChan?.permissionOverwrites?.cache?.get?.(targetRoleId);
+    return {
+      channelId: targetChan.id,
+      targetRoleId,
+      existed: Boolean(existingOw),
+      allow: existingOw?.allow?.bitfield ?? 0n,
+      deny: existingOw?.deny?.bitfield ?? 0n,
+      type: existingOw?.type ?? 0,
+    };
+  };
+
+  const undoOverwrites = [captureOverwrite(channel)];
+
   await applyChannelPermissionOverwrite(channel, {
     targetRoleId,
     overwriteObj,
@@ -1348,6 +1565,15 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
 
   if (syncChildren && childChannels.length > 0) {
     for (const child of childChannels) {
+      const childProtection = antiNuke.checkProtectedChannel(child, guild, {
+        actionLogs,
+        member,
+      });
+      if (childProtection.protected) {
+        skippedChildren.push('#' + child.name + ' (protege)');
+        continue;
+      }
+
       if (typeof child.permissionOverwrites?.edit !== 'function') {
         skippedChildren.push('#' + child.name);
         continue;
@@ -1376,12 +1602,14 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
       }
 
       try {
+        const prevChildOw = captureOverwrite(child);
         await applyChannelPermissionOverwrite(child, {
           targetRoleId,
           overwriteObj,
           protectBotAccess,
           botId: me?.id,
         });
+        undoOverwrites.push(prevChildOw);
         syncedCount += 1;
       } catch (err) {
         console.error(
@@ -1417,6 +1645,11 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
     isCategory,
     syncedCount,
     skippedChildren,
+    undo: {
+      kind: 'restore_overwrites',
+      entries: undoOverwrites,
+      label: `Restaurer les permissions de ${channelLabel} pour ${roleLabel}`,
+    },
     result:
       'Permissions mises a jour sur ' +
       channelLabel +
@@ -1430,6 +1663,12 @@ async function setChannelPermissions(args, guild, member, { mode, userText }) {
 }
 
 function findCategoryByName(guild, categoryName) {
+  if (!guild?.channels?.cache) return null;
+  const catId = extractSnowflakeId(categoryName);
+  if (catId) {
+    const byId = guild.channels.cache.get(catId);
+    return byId && byId.type === ChannelType.GuildCategory ? byId : null;
+  }
   const target = normalizeText(categoryName);
   if (!target) return null;
 
@@ -1445,9 +1684,9 @@ function findCategoryByName(guild, categoryName) {
   );
 }
 
-function findCategoryId(guild, hint, channelName) {
+function findCategoryId(guild, hint, channelName, member = null) {
   const categories = guild.channels.cache.filter(
-    (c) => c.type === ChannelType.GuildCategory
+    (c) => c.type === ChannelType.GuildCategory && canMemberViewChannel(c, member, guild)
   );
 
   if (categories.size === 0) return null;
@@ -1665,10 +1904,234 @@ async function searchAppDirectory(args, { fetchFn } = {}) {
   };
 }
 
+async function executeUndoAction(guild, undo, { member = null } = {}) {
+  if (!guild || !undo || !undo.kind) {
+    return { ok: false, error: 'Action de retour en arriere invalide.' };
+  }
+
+  const checkUndoAuth = ({
+    requiredPermission,
+    requiredPermissions,
+    targetChannel,
+    targetRole,
+    requestedPermFlags,
+    allowManagedRoles = false,
+  }) => {
+    const botCheck = checkBotPermissions({
+      guild,
+      requiredPermission,
+      requiredPermissions,
+      targetChannel,
+      targetRole,
+      requestedPermFlags,
+      allowManagedRoles,
+    });
+    if (!botCheck.ok) {
+      return { ok: false, error: botCheck.error };
+    }
+    if (member) {
+      const memberCheck = checkMemberAuthorization({
+        guild,
+        member,
+        requiredPermission,
+        requiredPermissions,
+        targetChannel,
+        targetRole,
+        requestedPermFlags,
+      });
+      if (!memberCheck.authorized) {
+        return { ok: false, error: memberCheck.reason };
+      }
+    }
+    return { ok: true };
+  };
+
+  try {
+    switch (undo.kind) {
+      case 'delete_channel': {
+        const ch = guild.channels?.cache?.get?.(undo.channelId);
+        if (!ch) return { ok: true, result: 'Salon deja supprime.' };
+        const prot = antiNuke.checkProtectedChannel(ch, guild, { actionLogs, member });
+        if (prot.protected) {
+          return { ok: false, error: '🛡️ ' + prot.reason };
+        }
+        const auth = checkUndoAuth({
+          requiredPermission: 'ManageChannels',
+          targetChannel: ch,
+        });
+        if (!auth.ok) return auth;
+        await ch.delete('Retour en arriere CIVIS');
+        return { ok: true, result: undo.label || 'Salon cree supprime.' };
+      }
+      case 'delete_role': {
+        const r = guild.roles?.cache?.get?.(undo.roleId);
+        if (!r) return { ok: true, result: 'Role deja supprime.' };
+        const auth = checkUndoAuth({
+          requiredPermission: 'ManageRoles',
+          targetRole: r,
+        });
+        if (!auth.ok) return auth;
+        await r.delete('Retour en arriere CIVIS');
+        return { ok: true, result: undo.label || 'Role cree supprime.' };
+      }
+      case 'restore_channel': {
+        const ch = guild.channels?.cache?.get?.(undo.channelId);
+        if (!ch) return { ok: false, error: 'Salon introuvable pour restauration.' };
+        const prot = antiNuke.checkProtectedChannel(ch, guild, { actionLogs, member });
+        if (prot.protected) {
+          return { ok: false, error: '🛡️ ' + prot.reason };
+        }
+        const hasOverwrites = Boolean(undo.prevState?.permissionOverwrites);
+        const auth = checkUndoAuth({
+          requiredPermissions: hasOverwrites
+            ? ['ManageChannels', 'ManageRoles']
+            : ['ManageChannels'],
+          targetChannel: ch,
+        });
+        if (!auth.ok) return auth;
+        await ch.edit(undo.prevState || {});
+        return { ok: true, result: undo.label || 'Salon restaure.' };
+      }
+      case 'restore_role': {
+        const r = guild.roles?.cache?.get?.(undo.roleId);
+        if (!r) return { ok: false, error: 'Role introuvable pour restauration.' };
+        let requestedPermFlags = [];
+        if (undo.prevState?.permissions !== undefined) {
+          const prevBits = new PermissionsBitField(undo.prevState.permissions);
+          const prevArr = prevBits.toArray();
+          const curBits = r.permissions ? new PermissionsBitField(r.permissions) : new PermissionsBitField(0n);
+          const curArr = curBits.toArray();
+          requestedPermFlags = [
+            ...new Set([
+              ...prevArr.filter((f) => !curBits.has(PermissionsBitField.Flags[f])),
+              ...curArr.filter((f) => !prevBits.has(PermissionsBitField.Flags[f])),
+            ]),
+          ];
+        }
+        const auth = checkUndoAuth({
+          requiredPermission: 'ManageRoles',
+          targetRole: r,
+          requestedPermFlags,
+        });
+        if (!auth.ok) return auth;
+        await r.edit(undo.prevState || {});
+        return { ok: true, result: undo.label || 'Role restaure.' };
+      }
+      case 'recreate_channel': {
+        const snap = undo.snapshot || {};
+        const parentCh =
+          snap.parent && guild.channels?.cache?.get?.(snap.parent)
+            ? guild.channels.cache.get(snap.parent)
+            : null;
+        const hasOverwrites =
+          Array.isArray(snap.permissionOverwrites) && snap.permissionOverwrites.length > 0;
+        const auth = checkUndoAuth({
+          requiredPermissions: hasOverwrites
+            ? ['ManageChannels', 'ManageRoles']
+            : ['ManageChannels'],
+          targetChannel: parentCh,
+        });
+        if (!auth.ok) return auth;
+        const createOpts = {
+          name: snap.name || 'salon-restaure',
+          type: snap.type ?? ChannelType.GuildText,
+        };
+        if (parentCh) {
+          createOpts.parent = snap.parent;
+        }
+        if (snap.topic !== undefined) createOpts.topic = snap.topic;
+        if (snap.nsfw !== undefined) createOpts.nsfw = snap.nsfw;
+        if (snap.rateLimitPerUser !== undefined) createOpts.rateLimitPerUser = snap.rateLimitPerUser;
+        if (hasOverwrites) {
+          createOpts.permissionOverwrites = snap.permissionOverwrites;
+        }
+        await guild.channels.create(createOpts);
+        return { ok: true, result: undo.label || 'Salon recree.' };
+      }
+      case 'recreate_role': {
+        const snap = undo.snapshot || {};
+        const requestedPermFlags = snap.permissions
+          ? new PermissionsBitField(snap.permissions).toArray()
+          : [];
+        const auth = checkUndoAuth({
+          requiredPermission: 'ManageRoles',
+          requestedPermFlags,
+        });
+        if (!auth.ok) return auth;
+        const createOpts = {
+          name: snap.name || 'role-restaure',
+          hoist: Boolean(snap.hoist),
+          mentionable: Boolean(snap.mentionable),
+          permissions: snap.permissions ?? 0n,
+        };
+        if (snap.colors) createOpts.colors = snap.colors;
+        await guild.roles.create(createOpts);
+        return { ok: true, result: undo.label || 'Role recree.' };
+      }
+      case 'restore_overwrites': {
+        const entries = Array.isArray(undo.entries) ? undo.entries : [];
+        const validatedEntries = [];
+        for (const item of entries) {
+          const ch = guild.channels?.cache?.get?.(item.channelId);
+          if (!ch?.permissionOverwrites) continue;
+          const prot = antiNuke.checkProtectedChannel(ch, guild, { actionLogs, member });
+          if (prot.protected) {
+            return { ok: false, error: '🛡️ ' + prot.reason };
+          }
+          const targetRole =
+            item.targetRoleId && item.targetRoleId !== guild.id
+              ? guild.roles?.cache?.get?.(item.targetRoleId) || null
+              : null;
+          const currentOw = ch.permissionOverwrites?.cache?.get?.(item.targetRoleId);
+          const flagsSet = new Set([
+            ...new PermissionsBitField(item.allow || 0n).toArray(),
+            ...new PermissionsBitField(item.deny || 0n).toArray(),
+            ...(currentOw?.allow ? new PermissionsBitField(currentOw.allow).toArray() : []),
+            ...(currentOw?.deny ? new PermissionsBitField(currentOw.deny).toArray() : []),
+          ]);
+          const auth = checkUndoAuth({
+            requiredPermissions: ['ManageChannels', 'ManageRoles'],
+            targetChannel: ch,
+            targetRole,
+            requestedPermFlags: [...flagsSet],
+            allowManagedRoles: true,
+          });
+          if (!auth.ok) return auth;
+          validatedEntries.push({ ch, item });
+        }
+        for (const { ch, item } of validatedEntries) {
+          if (!item.existed && typeof ch.permissionOverwrites.delete === 'function') {
+            await ch.permissionOverwrites.delete(item.targetRoleId);
+          } else if (typeof ch.permissionOverwrites.create === 'function' || typeof ch.permissionOverwrites.edit === 'function') {
+            const allowFlags = new PermissionsBitField(item.allow || 0n).toArray();
+            const denyFlags = new PermissionsBitField(item.deny || 0n).toArray();
+            const obj = {};
+            for (const f of allowFlags) obj[f] = true;
+            for (const f of denyFlags) obj[f] = false;
+            if (typeof ch.permissionOverwrites.delete === 'function' && allowFlags.length === 0 && denyFlags.length === 0) {
+              await ch.permissionOverwrites.delete(item.targetRoleId);
+            } else if (typeof ch.permissionOverwrites.edit === 'function') {
+              await ch.permissionOverwrites.edit(item.targetRoleId, obj);
+            }
+          }
+        }
+        return { ok: true, result: undo.label || 'Permissions restaurees.' };
+      }
+      default:
+        return { ok: false, error: 'Type de retour en arriere inconnu : ' + undo.kind };
+    }
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 module.exports = {
   executeTool,
+  executeUndoAction,
   archiveChannel,
   archiveRole,
+  findRoleByName,
+  findManagedChannelByName,
   findCategoryByName,
   searchAppDirectory,
   resolveAppDirectoryCategoryId,

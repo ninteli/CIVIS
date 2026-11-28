@@ -253,7 +253,7 @@ describe('Interface Components V2 (ui-v2.js, format.js, events.js, commands.js)'
       assert.match(uiV2.extractV2Text(dbgMsg.replies[0]), /Mode Debug/);
       debug.disable(chId);
 
-      // 5. Erreur lors de processMessage
+      // 5. Erreur lors de processMessage (ne fuite pas err.message brut)
       brain.processMessage = async () => {
         throw new Error('Serveur LLM indisponible');
       };
@@ -262,7 +262,9 @@ describe('Interface Components V2 (ui-v2.js, format.js, events.js, commands.js)'
       assert.equal(errMsg.replies.length, 1);
       assertValidV2Payload(errMsg.replies[0]);
       assert.equal(uiV2.toPlainComponent(errMsg.replies[0].components[0]).accent_color, uiV2.COLORS.DANGER);
-      assert.match(uiV2.extractV2Text(errMsg.replies[0]), /Serveur LLM indisponible/);
+      const errText = uiV2.extractV2Text(errMsg.replies[0]);
+      assert.match(errText, /Une erreur interne est survenue/);
+      assert.doesNotMatch(errText, /Serveur LLM indisponible/);
     } finally {
       brain.processMessage = origProcess;
       debug.disable(chId);

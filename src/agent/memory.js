@@ -1,11 +1,25 @@
 // Mémoire par salon : garde les N derniers messages échangés
 const MAX_MESSAGES = 20;
+const MAX_CHANNELS = 500;
+const MAX_ACTION_KEYS = 1000;
 
 // Map : channelId -> tableau de { role, content, authorName, authorId }
 const memory = new Map();
 
 // Memoire isolee par couple (channelId, authorId) pour les modes d'action (/agent, /plan)
 const actionMemory = new Map();
+
+function setBoundedMap(map, key, value, maxSize) {
+  if (map.has(key)) {
+    map.delete(key);
+  }
+  map.set(key, value);
+  while (map.size > maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey === undefined) break;
+    map.delete(oldestKey);
+  }
+}
 
 function buildActionKey(channelId, authorId) {
   const ch = String(channelId || '').trim();
@@ -19,10 +33,8 @@ function getHistory(channelId) {
 }
 
 function addMessage(channelId, { role, content, authorName, authorId }) {
-  if (!memory.has(channelId)) {
-    memory.set(channelId, []);
-  }
-  const history = memory.get(channelId);
+  const history = memory.get(channelId) || [];
+  setBoundedMap(memory, channelId, history, MAX_CHANNELS);
   history.push({ role, content, authorName, authorId });
 
   // Tronque si on dépasse la limite
@@ -49,10 +61,8 @@ function getActionHistory(channelId, authorId) {
 function addActionMessage(channelId, authorId, { role, content, authorName }) {
   const key = buildActionKey(channelId, authorId);
   if (!key) return;
-  if (!actionMemory.has(key)) {
-    actionMemory.set(key, []);
-  }
-  const history = actionMemory.get(key);
+  const history = actionMemory.get(key) || [];
+  setBoundedMap(actionMemory, key, history, MAX_ACTION_KEYS);
   history.push({ role, content, authorName, authorId });
   while (history.length > MAX_MESSAGES) {
     history.shift();

@@ -43,7 +43,11 @@ if [ ! -f "$PRESET_PATH" ]; then
         exit 1
     fi
     echo "Creation de models-preset.ini depuis models-preset.ini.example (MODELS_DIR=$MODELS_DIR)..."
-    sed "s|__MODELS_DIR__|$MODELS_DIR|g" "$PRESET_EXAMPLE" > "$PRESET_PATH"
+    node -e '
+    const fs = require("node:fs");
+    const tpl = fs.readFileSync(process.argv[1], "utf8");
+    fs.writeFileSync(process.argv[2], tpl.split("__MODELS_DIR__").join(process.argv[3]), "utf8");
+    ' "$PRESET_EXAMPLE" "$PRESET_PATH" "$MODELS_DIR"
 fi
 
 # 2. Verification du serveur llama-server
@@ -53,21 +57,42 @@ if [ ! -f "$LLAMA_SERVER" ]; then
     exit 1
 fi
 
-# 3. Verification du .env
+# 3. Verification du .env et cle API locale
 if [ ! -f "$SCRIPT_DIR/.env" ]; then
     echo "ERREUR : .env introuvable dans $SCRIPT_DIR"
     echo "Copie .env.example vers .env et renseigne DISCORD_TOKEN."
     exit 1
 fi
 
+if [ -z "${LLM_API_KEY:-}" ]; then
+    LLM_API_KEY="$(node -e '
+    const fs = require("node:fs");
+    const dotenv = require("dotenv");
+    const parsed = dotenv.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (parsed.LLM_API_KEY) process.stdout.write(parsed.LLM_API_KEY.trim());
+    ' "$SCRIPT_DIR/.env")"
+fi
+if [ -z "${LLM_API_KEY:-}" ]; then
+    LLM_API_KEY="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(24).toString("hex"))')"
+fi
+export LLM_API_KEY
+
 # 4. Lancement du routeur llama-server (Gemma 3 1B + Qwen 2.5 3B)
 echo "[1/2] Lancement du routeur LLM (gemma3:1B + qwen2.5:3B, models-max=$MODELS_MAX)..."
-if curl -s --max-time 2 "http://$LLM_HOST:$LLM_PORT/props" 2>/dev/null | grep -q '"role":"router"'; then
+if curl -s --max-time 2 -H "Authorization: Bearer $LLM_API_KEY" "http://$LLM_HOST:$LLM_PORT/props" 2>/dev/null | grep -q '"role":"router"'; then
     echo "  -> Routeur deja en cours d execution, on skip"
 else
     if curl -s --max-time 2 "http://$LLM_HOST:$LLM_PORT/v1/models" > /dev/null 2>&1; then
         echo "  -> Ancien serveur LLM non-routeur detecte, arret..."
-        pkill -f "llama-server" 2>/dev/null || true
+        if [ -f "$SCRIPT_DIR/.llama-server.pid" ]; then
+            OLD_LLAMA_PID="$(cat "$SCRIPT_DIR/.llama-server.pid" 2>/dev/null || true)"
+            if [ -n "$OLD_LLAMA_PID" ] && kill -0 "$OLD_LLAMA_PID" 2>/dev/null; then
+                kill "$OLD_LLAMA_PID" 2>/dev/null || true
+            fi
+            rm -f "$SCRIPT_DIR/.llama-server.pid"
+        else
+            pkill -f "llama-server.*--models-preset" 2>/dev/null || true
+        fi
         sleep 1
     fi
 
@@ -76,12 +101,16 @@ else
         --models-max "$MODELS_MAX" \
         --port "$LLM_PORT" \
         --host "$LLM_HOST" \
+        --api-key "$LLM_API_KEY" \
         > "$SCRIPT_DIR/llama-server.log" 2>&1 &
-    echo "  -> Lance en arriere-plan (log: $SCRIPT_DIR/llama-server.log)"
+    LLAMA_PID=$!
+    echo "$LLAMA_PID" > "$SCRIPT_DIR/.llama-server.pid"
+    chmod 600 "$SCRIPT_DIR/.llama-server.pid" 2>/dev/null || true
+    echo "  -> Lance en arriere-plan (PID $LLAMA_PID, log: $SCRIPT_DIR/llama-server.log)"
 
     echo "  -> Attente du demarrage (max 60s)..."
     for i in {1..60}; do
-        if curl -s --max-time 1 "http://$LLM_HOST:$LLM_PORT/v1/models" > /dev/null 2>&1; then
+        if curl -s --max-time 1 -H "Authorization: Bearer $LLM_API_KEY" "http://$LLM_HOST:$LLM_PORT/v1/models" > /dev/null 2>&1; then
             echo "  -> Serveur LLM pret !"
             break
         fi
@@ -95,4 +124,12 @@ cd "$SCRIPT_DIR"
 echo ""
 echo "=== Bot en cours d execution (Ctrl+C pour arreter) ==="
 echo ""
-node index.js
+node index.js &
+BOT_PID=$!
+echo "$BOT_PID" > "$SCRIPT_DIR/.civis-bot.pid"
+chmod 600 "$SCRIPT_DIR/.civis-bot.pid" 2>/dev/null || true
+trap 'rm -f "$SCRIPT_DIR/.civis-bot.pid"; kill "$BOT_PID" 2>/dev/null || true' INT TERM
+wait "$BOT_PID"
+EXIT_CODE=$?
+rm -f "$SCRIPT_DIR/.civis-bot.pid"
+exit "$EXIT_CODE"

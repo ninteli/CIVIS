@@ -5,8 +5,9 @@ const {
   ButtonStyle,
 } = require('discord.js');
 const memory = require('../agent/memory');
+const antiNuke = require('../agent/anti-nuke');
 const { executeTool, archiveChannel, archiveRole } = require('../agent/tool-executor');
-const { checkMemberAuthorization } = require('../agent/permissions');
+const { checkMemberAuthorization, isGuildOwner } = require('../agent/permissions');
 const {
   COLORS,
   buildV2Card,
@@ -225,12 +226,39 @@ async function createApprovalRequest({
     if (approval.onTimeoutAction === 'archive_channel' && approval.targetChannelId) {
       let archiveRes;
       try {
-        archiveRes = await archiveChannel(guild, approval.targetChannelId);
+        const targetCh = guild?.channels?.cache?.get?.(approval.targetChannelId) || null;
+        const prot = targetCh
+          ? antiNuke.checkProtectedChannel(targetCh, guild, { actionLogs, member: null })
+          : { protected: false };
+        if (prot.protected) {
+          archiveRes = { ok: false, error: '🛡️ Archivage interdit : ' + prot.reason };
+        } else {
+          archiveRes = await archiveChannel(guild, approval.targetChannelId);
+        }
       } catch (err) {
         archiveRes = { ok: false, error: err.message };
       }
 
       if (archiveRes.ok) {
+        if (requester?.id && !isGuildOwner(guild, { id: requester.id })) {
+          const burst = antiNuke.recordBurstActivity(
+            guild,
+            { id: requester.id },
+            { toolName: 'archive_channel' }
+          );
+          if (burst.blocked) {
+            await actionLogs.logSecurityAlert({
+              guild,
+              client: interaction?.client || null,
+              actorId: requester.id,
+              channelId: channel.id,
+              title: '🚨 Anti-Rafale declenche (auto-archivage)',
+              reason: burst.reason,
+              details: `Outil : archive_channel (${approval.title})`,
+              lockedMinutes: 10,
+            });
+          }
+        }
         timeoutCard = buildV2Card({
           color: COLORS.NEUTRAL,
           title: '📦 CIVIS — Salon archive',
@@ -314,6 +342,25 @@ async function createApprovalRequest({
       }
 
       if (archiveRes.ok) {
+        if (requester?.id && !isGuildOwner(guild, { id: requester.id })) {
+          const burst = antiNuke.recordBurstActivity(
+            guild,
+            { id: requester.id },
+            { toolName: 'archive_role' }
+          );
+          if (burst.blocked) {
+            await actionLogs.logSecurityAlert({
+              guild,
+              client: interaction?.client || null,
+              actorId: requester.id,
+              channelId: channel.id,
+              title: '🚨 Anti-Rafale declenche (auto-archivage)',
+              reason: burst.reason,
+              details: `Outil : archive_role (${approval.title})`,
+              lockedMinutes: 10,
+            });
+          }
+        }
         timeoutCard = buildV2Card({
           color: COLORS.NEUTRAL,
           title: '📦 CIVIS — Role archive',
@@ -614,6 +661,26 @@ async function handleApprovalButton(interaction) {
     return true;
   }
 
+  if (!isGuildOwner(interaction.guild, member)) {
+    const lock = antiNuke.checkUserLockout(interaction.guild.id, interaction.user.id);
+    if (lock.locked) {
+      const mins = Math.floor(lock.remainingSec / 60);
+      const secs = lock.remainingSec % 60;
+      const timeLabel = mins > 0 ? `${mins} min ${secs}s` : `${secs}s`;
+      await interaction.reply(
+        buildNoticePayload({
+          type: 'error',
+          title: '🚨 Acces bloque par l anti-nuke',
+          description:
+            `Toute intervention envers CIVIS est bloquee pour toi pendant encore **${timeLabel}**.\n` +
+            `• **Motif** : ${lock.reason}`,
+          ephemeral: true,
+        })
+      );
+      return true;
+    }
+  }
+
   pending.inProgress = true;
   clearTimeout(pending.timer);
 
@@ -621,6 +688,59 @@ async function handleApprovalButton(interaction) {
     await interaction.deferUpdate();
 
     const disabledRow = buildButtonsRow(requestId, true, pending.approval.kind);
+
+    if (!isGuildOwner(interaction.guild, member)) {
+      const burst = antiNuke.recordBurstActivity(interaction.guild, member, {
+        toolName: pending.approval.toolName,
+      });
+      if (burst.blocked) {
+        await actionLogs.logSecurityAlert({
+          guild: interaction.guild,
+          client: interaction.client,
+          actorId: interaction.user.id,
+          channelId: pending.channelId,
+          title: '🚨 Anti-Rafale declenche (validation bouton)',
+          reason: burst.reason,
+          details: `Outil bloque : ${pending.approval.toolName} (${pending.approval.title})`,
+          lockedMinutes: 10,
+        });
+        const blockedCard = buildV2Card({
+          color: COLORS.DANGER,
+          title: '🚨 CIVIS — Action bloquee par l anti-nuke',
+          sections: [
+            `Action de <@${interaction.user.id}> bloquee automatiquement pendant **10 minutes**.`,
+            { heading: '📌 Action', body: pending.approval.title },
+            { heading: '🛡️ Motif', body: burst.reason.slice(0, 1024) },
+          ],
+          footer: `🦊 CIVIS • Anti-Nuke • ${formatDiscordTimestamp(Date.now(), 't')}`,
+          actionRows: [disabledRow],
+        });
+        try {
+          await interaction.editReply(
+            buildV2Message(blockedCard, { allowedMentions: SAFE_ALLOWED_MENTIONS })
+          );
+        } catch (err) {
+          console.error('[approvals] Erreur mise a jour carte anti-nuke :', err.message);
+        }
+        await actionLogs.logAction({
+          guild: interaction.guild,
+          client: interaction.client,
+          trigger: 'approval',
+          ok: false,
+          toolName: pending.approval.toolName,
+          args: pending.approval.args,
+          error: burst.reason,
+          requesterId: pending.requesterId,
+          executorId: interaction.user.id,
+          channelId: pending.channelId,
+          userText: pending.approval.userText || '',
+          stats: pending.stats || null,
+          requestId,
+        });
+        return true;
+      }
+    }
+
     const deletingCurrentChannel =
       pending.approval.toolName === 'delete_channel' &&
       pending.approval.targetChannelId === pending.channelId;

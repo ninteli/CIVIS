@@ -13,6 +13,7 @@ const {
 const { executeTool } = require('../src/agent/tool-executor');
 const planner = require('../src/agent/planner');
 const plans = require('../src/discord/plans');
+const antiNuke = require('../src/agent/anti-nuke');
 const {
   V2_FLAG,
   V2_EPHEMERAL_FLAGS,
@@ -116,7 +117,9 @@ function createMockChannel({
       if (member?._channelPerms?.has(channel.id)) {
         return new PermissionsBitField(member._channelPerms.get(channel.id));
       }
-      return member?.permissions || new PermissionsBitField();
+      const perms = new PermissionsBitField(member?.permissions || []);
+      perms.add(PermissionsBitField.Flags.ViewChannel);
+      return perms;
     },
     async edit(updates) {
       channel.editCalls.push(updates);
@@ -349,6 +352,7 @@ function createModalSubmitInteraction({
 
 afterEach(() => {
   plans.clearAllPendingPlans();
+  antiNuke.clearAll();
 });
 
 describe('Nouveaux outils de structuration serveur (categories, permissions salons)', () => {
@@ -1246,11 +1250,12 @@ describe('Permissions de categorie entiere et modification interactive de plan',
     });
     assert.ok(planId);
 
-    // 3 boutons presents : Execute, Modifier, Annuler
+    // 4 boutons presents : Execute, Modifier, Annuler, Voir le JSON
     assert.equal(slash.editReplies[0].flags, V2_FLAG);
     const initialRow = extractV2Buttons(slash.editReplies[0]);
-    assert.equal(initialRow.length, 3);
+    assert.equal(initialRow.length, 4);
     assert.equal(initialRow[1].custom_id, 'plan:modify:' + planId);
+    assert.equal(initialRow[3].custom_id, 'plan:json:' + planId);
 
     // Un tiers non autorise ne peut pas ouvrir le modal
     const badModifyBtn = createButtonInteraction({
@@ -1703,5 +1708,256 @@ describe('Types de salons complets, salon de spoiler, cooldown, accents et affic
     assert.equal(listed.ok, true);
     assert.match(listed.result, /#entraide \(forum, categorie: sans categorie, cooldown 20s, spoiler/);
     assert.match(listed.result, /#scene \(conference, categorie: sans categorie/);
+  });
+
+  it('buildValidatedPlan utilise gemma3:1B (raisonnement) puis qwen2.5:3B (JSON) en local, et 1 seul appel en API externe', async () => {
+    const guild = createMockGuild({ botPerms: ['Administrator'], botPosition: 50 });
+    const admin = createMockMember({
+      id: 'admin-pipe',
+      perms: ['Administrator'],
+      highestPosition: 20,
+    });
+
+    const localCalls = [];
+    const localPlan = await planner.buildValidatedPlan({
+      userText: 'Cree un espace Staff avec un role Modo vert et un salon #staff',
+      guild,
+      member: admin,
+      userConfig: null,
+      chatFn: async (messages, opts) => {
+        localCalls.push({ messages, opts });
+        if (opts.localRole === 'chat') {
+          return {
+            content:
+              'Rapport : 1) Creer le role Modo vert. 2) Creer la categorie Staff. 3) Creer le salon texte #staff dans Staff.',
+            stats: { elapsedMs: 120, source: 'local', model: 'gemma3:1B' },
+          };
+        }
+        return {
+          content: JSON.stringify({
+            summary: 'Creation espace Staff',
+            steps: [
+              { tool: 'create_role', args: { name: 'Modo', color: 'vert' } },
+              { tool: 'create_category', args: { name: 'Staff' } },
+              { tool: 'create_channel', args: { name: 'staff', type: 'text', category: 'Staff' } },
+            ],
+          }),
+          stats: { elapsedMs: 250, source: 'local', model: 'qwen2.5:3B' },
+        };
+      },
+    });
+
+    assert.equal(localPlan.ok, true);
+    assert.equal(localCalls.length, 2);
+    assert.equal(localCalls[0].opts.localRole, 'chat');
+    assert.match(localCalls[0].messages[0].content, /MODE ANALYSE ET RAISONNEMENT/);
+    assert.equal(localCalls[1].opts.localRole, 'agent');
+    assert.match(localCalls[1].messages[1].content, /Rapport d analyse/);
+    assert.match(localCalls[1].messages[1].content, /Creer le role Modo vert/);
+    assert.equal(localPlan.stats.elapsedMs, 370);
+    assert.equal(localPlan.stats.model, 'gemma3:1B -> qwen2.5:3B');
+    assert.deepEqual(localPlan.stats.pipeline, {
+      reasoningModel: 'gemma3:1B',
+      reasoningElapsedMs: 120,
+      jsonModel: 'qwen2.5:3B',
+      jsonElapsedMs: 250,
+    });
+    // Traduction deterministe sans IA : labels lisibles generes a partir du JSON
+    assert.equal(localPlan.plan.steps[0].label, 'Creer le role "Modo" (couleur vert)');
+    assert.equal(localPlan.plan.steps[1].label, 'Creer la categorie "Staff"');
+    assert.equal(localPlan.plan.steps[2].label, 'Creer le salon #staff (texte, cat: Staff)');
+
+    // Avec cle API externe : 1 seul appel
+    const apiCalls = [];
+    const apiPlan = await planner.buildValidatedPlan({
+      userText: 'Cree une categorie Archives',
+      guild,
+      member: admin,
+      userConfig: {
+        provider: 'openai',
+        label: 'OpenAI',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o-mini',
+        apiKey: 'sk-test-1234567890',
+      },
+      chatFn: async (messages, opts) => {
+        apiCalls.push({ messages, opts });
+        return {
+          content: JSON.stringify({
+            summary: 'Creation categorie Archives',
+            steps: [{ tool: 'create_category', args: { name: 'Archives' } }],
+          }),
+          stats: { elapsedMs: 90, source: 'api', model: 'gpt-4o-mini' },
+        };
+      },
+    });
+
+    assert.equal(apiPlan.ok, true);
+    assert.equal(apiCalls.length, 1);
+    assert.equal(apiPlan.stats.pipeline, undefined);
+    assert.equal(apiPlan.stats.model, 'gpt-4o-mini');
+  });
+
+  it('bouton Voir le JSON affiche le JSON propre en ephemere, se met a jour apres revision et reste consultable apres annulation', async () => {
+    const guild = createMockGuild({ botPerms: ['Administrator'], botPosition: 50 });
+    const chan = createMockChannel({
+      id: 'chan-json-btn',
+      name: 'general',
+      channelsCache: guild.channels.cache,
+    });
+    guild.channels.cache.set(chan.id, chan);
+
+    const admin = createMockMember({
+      id: 'admin-json',
+      perms: ['Administrator'],
+      highestPosition: 20,
+    });
+
+    const v1Analyzed = planner.validateAndAnalyzePlan(
+      {
+        summary: 'Setup Staff v1',
+        steps: [
+          { tool: 'create_category', args: { name: 'Staff' } },
+          { tool: 'create_channel', args: { name: 'staff-chat', type: 'text', category: 'Staff' } },
+        ],
+      },
+      guild,
+      admin
+    );
+    assert.equal(v1Analyzed.ok, true);
+
+    const v2Analyzed = planner.validateAndAnalyzePlan(
+      {
+        summary: 'Setup Staff v2',
+        steps: [
+          { tool: 'create_category', args: { name: 'Staff' } },
+          { tool: 'create_channel', args: { name: 'staff-chat', type: 'text', category: 'Staff' } },
+          { tool: 'create_channel', args: { name: 'staff-vocal', type: 'voice', category: 'Staff' } },
+        ],
+      },
+      guild,
+      admin
+    );
+    assert.equal(v2Analyzed.ok, true);
+
+    const slash = createSlashInteraction({
+      guild,
+      channel: chan,
+      user: { id: admin.id },
+      member: admin,
+    });
+    const planId = await plans.createPlanRequest({
+      interaction: slash,
+      channel: chan,
+      guild,
+      requester: { id: admin.id },
+      requesterMember: admin,
+      plan: v1Analyzed.plan,
+      security: v1Analyzed.security,
+      userText: 'cree espace Staff',
+      stats: {
+        elapsedMs: 370,
+        model: 'gemma3:1B -> qwen2.5:3B',
+        pipeline: {
+          reasoningModel: 'gemma3:1B',
+          reasoningElapsedMs: 120,
+          jsonModel: 'qwen2.5:3B',
+          jsonElapsedMs: 250,
+        },
+      },
+      isDebug: true,
+      stepDelayMs: 0,
+      revisePlanFn: async () => ({
+        ok: true,
+        plan: v2Analyzed.plan,
+        security: v2Analyzed.security,
+        stats: { elapsedMs: 150, model: 'qwen2.5:3B' },
+      }),
+    });
+
+    // Debug affiche le detail du pipeline 2 etapes
+    const cardText = extractV2Text(slash.editReplies[0]);
+    assert.match(cardText, /Raisonnement : `gemma3:1B` \(`120 ms`\) -> JSON : `qwen2\.5:3B` \(`250 ms`\)/);
+
+    // Un membre sans permission ne peut pas consulter le JSON d un plan
+    const unauthorizedJsonBtn = createButtonInteraction({
+      customId: 'plan:json:' + planId,
+      guild,
+      channel: chan,
+      user: { id: 'viewer-1' },
+      member: createMockMember({ id: 'viewer-1', perms: [] }),
+    });
+    const handledUnauth = await plans.handlePlanButton(unauthorizedJsonBtn);
+    assert.equal(handledUnauth, true);
+    assert.equal(unauthorizedJsonBtn.replies.length, 1);
+    assert.equal(unauthorizedJsonBtn.replies[0].flags, V2_EPHEMERAL_FLAGS);
+    assert.match(extractV2Text(unauthorizedJsonBtn.replies[0]), /Action non autorisee/);
+
+    // Clic sur Voir le JSON (v1) par un membre autorise
+    const jsonBtnV1 = createButtonInteraction({
+      customId: 'plan:json:' + planId,
+      guild,
+      channel: chan,
+      user: { id: admin.id },
+      member: admin,
+    });
+    const handledV1 = await plans.handlePlanButton(jsonBtnV1);
+    assert.equal(handledV1, true);
+    assert.equal(jsonBtnV1.replies.length, 1);
+    assert.equal(jsonBtnV1.replies[0].flags, V2_EPHEMERAL_FLAGS);
+    const jsonTextV1 = extractV2Text(jsonBtnV1.replies[0]);
+    assert.match(jsonTextV1, /```json/);
+    assert.match(jsonTextV1, /"summary": "Setup Staff v1"/);
+    assert.match(jsonTextV1, /"tool": "create_category"/);
+    assert.ok(!jsonTextV1.includes('"label"'));
+
+    // Revision du plan -> v2
+    const modal = createModalSubmitInteraction({
+      customId: 'plan:revise:' + planId,
+      guild,
+      channel: chan,
+      user: { id: admin.id },
+      member: admin,
+      instructions: 'Ajoute un salon vocal',
+    });
+    await plans.handlePlanModal(modal);
+
+    // Clic sur Voir le JSON (v2)
+    const jsonBtnV2 = createButtonInteraction({
+      customId: 'plan:json:' + planId,
+      guild,
+      channel: chan,
+      user: { id: admin.id },
+      member: admin,
+    });
+    await plans.handlePlanButton(jsonBtnV2);
+    const jsonTextV2 = extractV2Text(jsonBtnV2.replies[0]);
+    assert.match(jsonTextV2, /JSON du plan \(v2\)/);
+    assert.match(jsonTextV2, /"staff-vocal"/);
+
+    // Annulation du plan -> le bouton Voir le JSON reste actif et consultable
+    const cancelBtn = createButtonInteraction({
+      customId: 'plan:cancel:' + planId,
+      guild,
+      channel: chan,
+      user: { id: admin.id },
+      member: admin,
+    });
+    await plans.handlePlanButton(cancelBtn);
+    const cancelledButtons = extractV2Buttons(cancelBtn.updates[0]);
+    assert.equal(cancelledButtons[0].disabled, true);
+    assert.equal(cancelledButtons[3].custom_id, 'plan:json:' + planId);
+    assert.equal(cancelledButtons[3].disabled, false);
+
+    const jsonBtnAfterCancel = createButtonInteraction({
+      customId: 'plan:json:' + planId,
+      guild,
+      channel: chan,
+      user: { id: admin.id },
+      member: admin,
+    });
+    await plans.handlePlanButton(jsonBtnAfterCancel);
+    assert.equal(jsonBtnAfterCancel.replies[0].flags, V2_EPHEMERAL_FLAGS);
+    assert.match(extractV2Text(jsonBtnAfterCancel.replies[0]), /"summary": "Setup Staff v2"/);
   });
 });

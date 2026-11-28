@@ -5,9 +5,16 @@ const {
 } = require('./ui-v2');
 
 const SAFE_ALLOWED_MENTIONS = {
-  parse: ['users'],
+  parse: [],
   repliedUser: true,
 };
+
+function sanitizePublicError(
+  _err,
+  fallback = 'Une erreur interne est survenue. Reessaie dans quelques instants.'
+) {
+  return String(fallback || 'Une erreur interne est survenue. Reessaie dans quelques instants.');
+}
 
 const NOTICE_STYLES = {
   primary: { color: COLORS.PRIMARY, emoji: '🦊' },
@@ -222,6 +229,7 @@ function buildChatReplyPayload({
 module.exports = {
   COLORS,
   SAFE_ALLOWED_MENTIONS,
+  sanitizePublicError,
   buildActionPrefix,
   formatActionPill,
   buildDebugEmbed,

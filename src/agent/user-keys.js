@@ -50,27 +50,47 @@ function maskApiKey(key) {
   return s.slice(0, 4) + '...' + s.slice(-4);
 }
 
-function isBlockedIpv4(host) {
-  const parts = host.split('.');
-  if (parts.length !== 4) return false;
-  const nums = parts.map((p) => Number(p));
-  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+const BLOCKED_IPV4_LIST = new net.BlockList();
+BLOCKED_IPV4_LIST.addSubnet('0.0.0.0', 8, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('10.0.0.0', 8, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('100.64.0.0', 10, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('127.0.0.0', 8, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('169.254.0.0', 16, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('172.16.0.0', 12, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('192.0.0.0', 24, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('192.0.2.0', 24, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('192.168.0.0', 16, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('198.18.0.0', 15, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('198.51.100.0', 24, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('203.0.113.0', 24, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('224.0.0.0', 4, 'ipv4');
+BLOCKED_IPV4_LIST.addSubnet('240.0.0.0', 4, 'ipv4');
 
-  const [a, b] = nums;
-  if (a === 0 || a === 10 || a === 127) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-  return false;
+const BLOCKED_IPV6_LIST = new net.BlockList();
+BLOCKED_IPV6_LIST.addSubnet('::', 96, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('::ffff:0:0', 96, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('64:ff9b::', 96, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('64:ff9b:1::', 48, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('100::', 64, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('2001::', 32, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('2001:2::', 48, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('2001:db8::', 32, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('2002::', 16, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('fc00::', 7, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('fe80::', 10, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('fec0::', 10, 'ipv6');
+BLOCKED_IPV6_LIST.addSubnet('ff00::', 8, 'ipv6');
+
+function isBlockedIpv4(host) {
+  if (!net.isIPv4(host)) return false;
+  return BLOCKED_IPV4_LIST.check(host, 'ipv4');
 }
 
 function isBlockedIpv6(host) {
-  const h = host.toLowerCase();
-  if (h === '::1' || h === '::' || h === '0:0:0:0:0:0:0:1') return true;
-  if (h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80:')) return true;
-  if (h.startsWith('::ffff:')) {
-    const mapped = h.slice('::ffff:'.length);
+  const clean = String(host || '').trim().replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+  if (!clean) return true;
+  if (clean.startsWith('::ffff:')) {
+    const mapped = clean.slice('::ffff:'.length);
     if (net.isIPv4(mapped)) return isBlockedIpv4(mapped);
     const hexMatch = mapped.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
     if (hexMatch) {
@@ -81,7 +101,8 @@ function isBlockedIpv6(host) {
     }
     return true;
   }
-  return false;
+  if (!net.isIPv6(clean)) return true;
+  return BLOCKED_IPV6_LIST.check(clean, 'ipv6');
 }
 
 function validateCustomUrl(rawUrl) {
@@ -106,7 +127,7 @@ function validateCustomUrl(rawUrl) {
   }
 
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (!host) {
+  if (!host || host.includes('%')) {
     return { ok: false, error: 'Nom d hote invalide dans l URL.' };
   }
 
@@ -141,7 +162,7 @@ function validateCustomUrl(rawUrl) {
 }
 
 function isBlockedIp(ip) {
-  const clean = String(ip || '').trim().replace(/^\[|\]$/g, '');
+  const clean = String(ip || '').trim().replace(/^\[|\]$/g, '').split('%')[0];
   if (!clean) return true;
   if (net.isIPv4(clean)) return isBlockedIpv4(clean);
   if (net.isIPv6(clean)) return isBlockedIpv6(clean);
@@ -154,7 +175,8 @@ async function validateCustomUrlDns(rawUrl, { lookupFn } = {}) {
 
   const host = new URL(syncCheck.url).hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (net.isIP(host)) {
-    return syncCheck;
+    const family = net.isIP(host);
+    return { ...syncCheck, addresses: [{ address: host, family }] };
   }
 
   const doLookup =
@@ -179,6 +201,7 @@ async function validateCustomUrlDns(rawUrl, { lookupFn } = {}) {
     };
   }
 
+  const addresses = [];
   for (const entry of list) {
     const addr = typeof entry === 'string' ? entry : entry?.address;
     if (isBlockedIp(addr)) {
@@ -187,9 +210,14 @@ async function validateCustomUrlDns(rawUrl, { lookupFn } = {}) {
         error: 'Le nom de domaine pointe vers une adresse IP privee ou locale interdite.',
       };
     }
+    const cleanAddr = String(addr).trim().replace(/^\[|\]$/g, '');
+    const family = typeof entry?.family === 'number' ? entry.family : net.isIP(cleanAddr);
+    if (cleanAddr && (family === 4 || family === 6)) {
+      addresses.push({ address: cleanAddr, family });
+    }
   }
 
-  return syncCheck;
+  return { ...syncCheck, addresses };
 }
 
 function createUserKeyStore(dataDir, options = {}) {
@@ -201,6 +229,8 @@ function createUserKeyStore(dataDir, options = {}) {
     ? options.legacyMasterKeyPaths
     : [];
   const keysPath = path.join(dataDir, 'user-keys.json');
+  let cachedEnvSecret = null;
+  let cachedEnvKey = null;
   let cachedFileKey = null;
 
   function ensureDir() {
@@ -208,12 +238,14 @@ function createUserKeyStore(dataDir, options = {}) {
   }
 
   function getMasterKey() {
-    if (process.env.KEY_ENCRYPTION_SECRET) {
-      return crypto.scryptSync(
-        process.env.KEY_ENCRYPTION_SECRET,
-        'ninteli-user-keys-v1',
-        32
-      );
+    const envSecret = process.env.KEY_ENCRYPTION_SECRET;
+    if (envSecret) {
+      if (cachedEnvKey && cachedEnvSecret === envSecret) {
+        return cachedEnvKey;
+      }
+      cachedEnvSecret = envSecret;
+      cachedEnvKey = crypto.scryptSync(envSecret, 'ninteli-user-keys-v1', 32);
+      return cachedEnvKey;
     }
 
     if (!cachedFileKey) {
@@ -238,36 +270,58 @@ function createUserKeyStore(dataDir, options = {}) {
 
   function writeStore(store) {
     ensureDir();
-    const tmpPath = keysPath + '.tmp.' + process.pid + '.' + Date.now();
+    const tmpPath =
+      keysPath + '.tmp.' + process.pid + '.' + crypto.randomBytes(4).toString('hex');
     fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), { mode: 0o600 });
     fs.chmodSync(tmpPath, 0o600);
     fs.renameSync(tmpPath, keysPath);
     fs.chmodSync(keysPath, 0o600);
   }
 
-  function encryptSecret(plaintext) {
+  function buildSecretAad(uid, provider, baseUrl) {
+    return Buffer.from(
+      'civis-user-key-v2:' +
+        String(uid || '') +
+        ':' +
+        String(provider || '') +
+        ':' +
+        String(baseUrl || ''),
+      'utf8'
+    );
+  }
+
+  function encryptSecret(plaintext, aad = null) {
     const masterKey = getMasterKey();
     const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', masterKey, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', masterKey, iv, { authTagLength: 16 });
+    if (aad) {
+      cipher.setAAD(aad);
+    }
     const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return {
+      v: aad ? 2 : 1,
       iv: iv.toString('base64'),
       tag: tag.toString('base64'),
       data: encrypted.toString('base64'),
     };
   }
 
-  function decryptSecret(secret) {
+  function decryptSecret(secret, aad = null) {
     if (!secret || !secret.iv || !secret.tag || !secret.data) return null;
     try {
+      const ivBuf = Buffer.from(secret.iv, 'base64');
+      const tagBuf = Buffer.from(secret.tag, 'base64');
+      if (ivBuf.length !== 12 || tagBuf.length !== 16) return null;
       const masterKey = getMasterKey();
-      const decipher = crypto.createDecipheriv(
-        'aes-256-gcm',
-        masterKey,
-        Buffer.from(secret.iv, 'base64')
-      );
-      decipher.setAuthTag(Buffer.from(secret.tag, 'base64'));
+      const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, ivBuf, {
+        authTagLength: 16,
+      });
+      if (secret.v === 2) {
+        if (!aad) return null;
+        decipher.setAAD(aad);
+      }
+      decipher.setAuthTag(tagBuf);
       const decrypted = Buffer.concat([
         decipher.update(Buffer.from(secret.data, 'base64')),
         decipher.final(),
@@ -325,7 +379,7 @@ function createUserKeyStore(dataDir, options = {}) {
       model: resolvedModel,
       maskedKey,
       updatedAt: new Date().toISOString(),
-      secret: encryptSecret(cleanKey),
+      secret: encryptSecret(cleanKey, buildSecretAad(uid, preset.id, baseUrl)),
     };
     writeStore(store);
 
@@ -348,7 +402,10 @@ function createUserKeyStore(dataDir, options = {}) {
     const record = Object.prototype.hasOwnProperty.call(store, uid) ? store[uid] : null;
     if (!record || !record.secret) return null;
 
-    const apiKey = decryptSecret(record.secret);
+    const apiKey = decryptSecret(
+      record.secret,
+      buildSecretAad(uid, record.provider, record.baseUrl)
+    );
     if (!apiKey) return null;
 
     return {

@@ -210,10 +210,16 @@ describe('Suggestions proactives sur Audit Logs (planner.js, plans.js, audit-sug
     const store = auditSuggestions.createGuildSuggestionsStore(tmpDir);
 
     const def = store.getGuildConfig('g-sug-1');
-    assert.equal(def.enabled, true);
-    assert.equal(def.mode, 'auto');
+    assert.equal(def.enabled, false);
+    assert.equal(def.mode, 'channel');
     assert.equal(def.channelId, null);
     assert.equal(def.cooldownSec, auditSuggestions.DEFAULT_COOLDOWN_SEC);
+
+    // Impossible d activer sans salon configure
+    const enableNoChan = store.enableSuggestions('g-sug-1', 'admin-1');
+    assert.equal(enableNoChan.ok, false);
+    assert.equal(store.getGuildConfig('g-sug-1').enabled, false);
+    assert.equal(auditSuggestions.setAutoChannel, undefined);
 
     store.setSuggestionChannel('g-sug-1', 'chan-sug-42', 'admin-1');
     let cfg = store.getGuildConfig('g-sug-1');
@@ -229,15 +235,16 @@ describe('Suggestions proactives sur Audit Logs (planner.js, plans.js, audit-sug
     assert.equal(cdOk.ok, true);
     assert.equal(cdOk.config.cooldownSec, 120);
 
-    store.setAutoChannel('g-sug-1', 'admin-2');
     cfg = store.getGuildConfig('g-sug-1');
-    assert.equal(cfg.mode, 'auto');
+    assert.equal(cfg.mode, 'channel');
+    assert.equal(cfg.channelId, 'chan-sug-42');
     assert.equal(cfg.cooldownSec, 120);
 
     store.disableSuggestions('g-sug-1', 'admin-3');
     assert.equal(store.getGuildConfig('g-sug-1').enabled, false);
 
-    store.enableSuggestions('g-sug-1', 'admin-3');
+    const enableWithChan = store.enableSuggestions('g-sug-1', 'admin-3');
+    assert.equal(enableWithChan.ok, true);
     assert.equal(store.getGuildConfig('g-sug-1').enabled, true);
 
     const filePath = path.join(tmpDir, 'guild-suggestions.json');
@@ -245,6 +252,7 @@ describe('Suggestions proactives sur Audit Logs (planner.js, plans.js, audit-sug
 
     store.resetGuildConfig('g-sug-1');
     assert.equal(store.getGuildConfig('g-sug-1').cooldownSec, auditSuggestions.DEFAULT_COOLDOWN_SEC);
+    assert.equal(store.getGuildConfig('g-sug-1').enabled, false);
   });
 
   it('decrit proprement les entrees Audit Log et deduplique les lots', () => {
@@ -412,6 +420,7 @@ describe('Suggestions proactives sur Audit Logs (planner.js, plans.js, audit-sug
   it('filtre bots/evenements ignores, regroupe en rafale, poste et execute/modifie/ignore un plan proactif avec logs IA', async () => {
     const tmpDir = makeTempDir();
     const store = auditSuggestions.createGuildSuggestionsStore(tmpDir);
+    store.setSuggestionChannel('hermetic-proactive-guild-1', 'chan-sug', 'admin-1');
     store.setCooldown('hermetic-proactive-guild-1', 60, 'admin-1');
 
     const guild = createMockGuild({ id: 'hermetic-proactive-guild-1', botPerms: ['Administrator'] });
@@ -586,8 +595,9 @@ describe('Suggestions proactives sur Audit Logs (planner.js, plans.js, audit-sug
     assert.ok(postedText.includes('Modification manuelle detectee'));
 
     const buttons = extractV2Buttons(posted);
-    assert.equal(buttons.length, 3);
+    assert.equal(buttons.length, 4);
     assert.equal(buttons[2].label, 'Ignorer');
+    assert.equal(buttons[3].label, 'Voir le JSON');
 
     const planId = buttons[0].custom_id.split(':')[2];
     assert.equal(plans.hasPendingProactivePlanForGuild(guild.id), true);
@@ -747,85 +757,157 @@ describe('Suggestions proactives sur Audit Logs (planner.js, plans.js, audit-sug
   });
 
   it('/suggestions commande slash : exige ManageGuild et affiche status + ViewAuditLog', async () => {
-    const guild = createMockGuild({
-      id: 'hermetic-sug-cmd-guild-1',
-      botPerms: ['ManageChannels', 'ViewAuditLog'],
-    });
-    const sugChan = createMockTextChannel({
-      id: 'c-sug-auto',
-      name: 'ninteli-suggestions',
-      channelsCache: guild.channels.cache,
-    });
-    guild.channels.cache.set(sugChan.id, sugChan);
+    auditSuggestions.resetGuildConfig('hermetic-sug-cmd-guild-1');
+    auditSuggestions.resetGuildConfig('hermetic-sug-cmd-guild-2');
+    try {
+      const guild = createMockGuild({
+        id: 'hermetic-sug-cmd-guild-1',
+        botPerms: ['ManageChannels', 'ViewAuditLog'],
+      });
+      const sugChan = createMockTextChannel({
+        id: 'c-sug-auto',
+        name: 'ninteli-suggestions',
+        channelsCache: guild.channels.cache,
+      });
+      guild.channels.cache.set(sugChan.id, sugChan);
 
-    const deniedReplies = [];
-    await commands.handleInteraction({
-      isButton: () => false,
-      isModalSubmit: () => false,
-      isChatInputCommand: () => true,
-      commandName: 'suggestions',
-      guild,
-      channel: sugChan,
-      user: { id: 'u-norm', username: 'user' },
-      member: createMockMember({ id: 'u-norm', perms: ['SendMessages'] }),
-      client: { user: { id: 'bot-1' } },
-      options: { getSubcommand: () => 'status' },
-      async reply(msg) {
-        deniedReplies.push(msg);
-      },
-    });
-    assert.equal(deniedReplies.length, 1);
-    assert.equal(deniedReplies[0].flags, V2_EPHEMERAL_FLAGS);
-    assert.equal(deniedReplies[0].content, undefined);
-    assert.ok(extractV2Text(deniedReplies[0]).includes('ManageGuild'));
+      const deniedReplies = [];
+      await commands.handleInteraction({
+        isButton: () => false,
+        isModalSubmit: () => false,
+        isChatInputCommand: () => true,
+        commandName: 'suggestions',
+        guild,
+        channel: sugChan,
+        user: { id: 'u-norm', username: 'user' },
+        member: createMockMember({ id: 'u-norm', perms: ['SendMessages'] }),
+        client: { user: { id: 'bot-1' } },
+        options: { getSubcommand: () => 'status' },
+        async reply(msg) {
+          deniedReplies.push(msg);
+        },
+      });
+      assert.equal(deniedReplies.length, 1);
+      assert.equal(deniedReplies[0].flags, V2_EPHEMERAL_FLAGS);
+      assert.equal(deniedReplies[0].content, undefined);
+      assert.ok(extractV2Text(deniedReplies[0]).includes('ManageGuild'));
 
-    const statusReplies = [];
-    await commands.handleInteraction({
-      isButton: () => false,
-      isModalSubmit: () => false,
-      isChatInputCommand: () => true,
-      commandName: 'suggestions',
-      guild,
-      channel: sugChan,
-      user: { id: 'admin-1', username: 'admin' },
-      member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
-      client: { user: { id: 'bot-1' } },
-      options: { getSubcommand: () => 'status' },
-      async reply(msg) {
-        statusReplies.push(msg);
-      },
-    });
-    assert.equal(statusReplies.length, 1);
-    assert.equal(statusReplies[0].flags, V2_EPHEMERAL_FLAGS);
-    const statusText = extractV2Text(statusReplies[0]);
-    assert.ok(statusText.includes('Actives'));
-    assert.ok(statusText.includes('<#c-sug-auto>'));
-    assert.ok(statusText.includes('45s'));
-    assert.ok(statusText.includes('Accordee'));
+      // /suggestions on sans salon configure echoue proprement
+      const noChanOnReplies = [];
+      await commands.handleInteraction({
+        isButton: () => false,
+        isModalSubmit: () => false,
+        isChatInputCommand: () => true,
+        commandName: 'suggestions',
+        guild,
+        channel: sugChan,
+        user: { id: 'admin-1', username: 'admin' },
+        member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
+        client: { user: { id: 'bot-1' } },
+        options: { getSubcommand: () => 'on' },
+        async reply(msg) {
+          noChanOnReplies.push(msg);
+        },
+      });
+      assert.equal(noChanOnReplies.length, 1);
+      assert.equal(noChanOnReplies[0].flags, V2_EPHEMERAL_FLAGS);
+      assert.ok(extractV2Text(noChanOnReplies[0]).includes('/suggestions set'));
 
-    // Also verify missing ViewAuditLog warning appears cleanly
-    const guildNoAudit = createMockGuild({
-      id: 'hermetic-sug-cmd-guild-2',
-      botPerms: ['SendMessages'],
-    });
-    guildNoAudit.channels.cache.set(sugChan.id, sugChan);
-    const missingAuditReplies = [];
-    await commands.handleInteraction({
-      isButton: () => false,
-      isModalSubmit: () => false,
-      isChatInputCommand: () => true,
-      commandName: 'suggestions',
-      guild: guildNoAudit,
-      channel: sugChan,
-      user: { id: 'admin-1', username: 'admin' },
-      member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
-      client: { user: { id: 'bot-1' } },
-      options: { getSubcommand: () => 'status' },
-      async reply(msg) {
-        missingAuditReplies.push(msg);
-      },
-    });
-    assert.equal(missingAuditReplies[0].flags, V2_EPHEMERAL_FLAGS);
-    assert.ok(extractV2Text(missingAuditReplies[0]).includes('Manquante'));
+      // Statut par defaut : desactive sans salon configure
+      const defaultStatusReplies = [];
+      await commands.handleInteraction({
+        isButton: () => false,
+        isModalSubmit: () => false,
+        isChatInputCommand: () => true,
+        commandName: 'suggestions',
+        guild,
+        channel: sugChan,
+        user: { id: 'admin-1', username: 'admin' },
+        member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
+        client: { user: { id: 'bot-1' } },
+        options: { getSubcommand: () => 'status' },
+        async reply(msg) {
+          defaultStatusReplies.push(msg);
+        },
+      });
+      assert.equal(defaultStatusReplies.length, 1);
+      assert.ok(extractV2Text(defaultStatusReplies[0]).includes('Desactivees'));
+      assert.ok(extractV2Text(defaultStatusReplies[0]).includes('Aucun salon configure'));
+
+      // Configurer via /suggestions set puis verifier /suggestions status
+      const setReplies = [];
+      await commands.handleInteraction({
+        isButton: () => false,
+        isModalSubmit: () => false,
+        isChatInputCommand: () => true,
+        commandName: 'suggestions',
+        guild,
+        channel: sugChan,
+        user: { id: 'admin-1', username: 'admin' },
+        member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
+        client: { user: { id: 'bot-1' } },
+        options: {
+          getSubcommand: () => 'set',
+          getChannel: () => sugChan,
+        },
+        async reply(msg) {
+          setReplies.push(msg);
+        },
+      });
+      assert.equal(setReplies.length, 1);
+      assert.ok(extractV2Text(setReplies[0]).includes('<#c-sug-auto>'));
+
+      const statusReplies = [];
+      await commands.handleInteraction({
+        isButton: () => false,
+        isModalSubmit: () => false,
+        isChatInputCommand: () => true,
+        commandName: 'suggestions',
+        guild,
+        channel: sugChan,
+        user: { id: 'admin-1', username: 'admin' },
+        member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
+        client: { user: { id: 'bot-1' } },
+        options: { getSubcommand: () => 'status' },
+        async reply(msg) {
+          statusReplies.push(msg);
+        },
+      });
+      assert.equal(statusReplies.length, 1);
+      assert.equal(statusReplies[0].flags, V2_EPHEMERAL_FLAGS);
+      const statusText = extractV2Text(statusReplies[0]);
+      assert.ok(statusText.includes('Actives'));
+      assert.ok(statusText.includes('<#c-sug-auto>'));
+      assert.ok(statusText.includes('45s'));
+      assert.ok(statusText.includes('Accordee'));
+
+      // Also verify missing ViewAuditLog warning appears cleanly
+      const guildNoAudit = createMockGuild({
+        id: 'hermetic-sug-cmd-guild-2',
+        botPerms: ['SendMessages'],
+      });
+      guildNoAudit.channels.cache.set(sugChan.id, sugChan);
+      const missingAuditReplies = [];
+      await commands.handleInteraction({
+        isButton: () => false,
+        isModalSubmit: () => false,
+        isChatInputCommand: () => true,
+        commandName: 'suggestions',
+        guild: guildNoAudit,
+        channel: sugChan,
+        user: { id: 'admin-1', username: 'admin' },
+        member: createMockMember({ id: 'admin-1', perms: ['ManageGuild'] }),
+        client: { user: { id: 'bot-1' } },
+        options: { getSubcommand: () => 'status' },
+        async reply(msg) {
+          missingAuditReplies.push(msg);
+        },
+      });
+      assert.equal(missingAuditReplies[0].flags, V2_EPHEMERAL_FLAGS);
+      assert.ok(extractV2Text(missingAuditReplies[0]).includes('Manquante'));
+    } finally {
+      auditSuggestions.resetGuildConfig('hermetic-sug-cmd-guild-1');
+      auditSuggestions.resetGuildConfig('hermetic-sug-cmd-guild-2');
+    }
   });
 });

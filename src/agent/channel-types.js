@@ -139,10 +139,19 @@ function parseCooldownArg(args) {
   return Math.min(parsed, 21600);
 }
 
+function extractSnowflakeId(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  if (s.startsWith('<') !== s.endsWith('>')) return null;
+  const match = /^(?:<#|<@&)?(\d{17,22})>?$/.exec(s);
+  return match ? match[1] : null;
+}
+
 module.exports = {
   MANAGED_CHANNEL_TYPES,
   TEXT_FEATURE_CHANNEL_TYPES,
   normalizeKey,
+  extractSnowflakeId,
   isManagedChannelType,
   supportsTextProperties,
   isVoiceLikeChannelType,

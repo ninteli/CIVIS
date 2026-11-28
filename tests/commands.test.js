@@ -49,6 +49,8 @@ describe('Enregistrement des commandes slash (commands.js)', () => {
     assert.ok(Array.isArray(globalCalls[0]) && globalCalls[0].length > 0);
     const names = globalCalls[0].map((c) => c.name);
     assert.equal(new Set(names).size, names.length);
+    assert.ok(names.includes('export'), 'La commande /export doit etre enregistree');
+    assert.ok(names.includes('import'), 'La commande /import doit etre enregistree');
 
     assert.deepEqual(guildCalls, [
       { guild: 'guild-1', data: [] },

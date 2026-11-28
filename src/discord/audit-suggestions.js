@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { AuditLogEvent, ChannelType, PermissionFlagsBits } = require('discord.js');
+const { AuditLogEvent, ChannelType, PermissionFlagsBits, PermissionsBitField } = require('discord.js');
 
 const debug = require('../agent/debug');
 const planner = require('../agent/planner');
@@ -29,23 +29,6 @@ const DEFAULT_COOLDOWN_SEC = 45;
 const MIN_COOLDOWN_SEC = 10;
 const MAX_COOLDOWN_SEC = 3600;
 const PROACTIVE_PLAN_TIMEOUT_MS = 300_000;
-
-const SUGGESTION_CHANNEL_CANDIDATES = [
-  'civis-suggestions',
-  'ninteli-suggestions',
-  'suggestions-ia',
-  'suggestions',
-  'civis',
-  'ninteli',
-  'staff',
-  'admin',
-  'bot-logs',
-  'logs',
-  'bot',
-  'commandes',
-  'general',
-  'général',
-];
 
 const NON_TEXT_CHANNEL_TYPES = new Set([
   ChannelType.GuildVoice,
@@ -95,8 +78,8 @@ function writeFileAtomic(filePath, content) {
 function normalizeGuildConfig(raw) {
   if (!raw || typeof raw !== 'object') {
     return {
-      enabled: true,
-      mode: 'auto',
+      enabled: false,
+      mode: 'channel',
       channelId: null,
       cooldownSec: DEFAULT_COOLDOWN_SEC,
       updatedBy: null,
@@ -106,11 +89,12 @@ function normalizeGuildConfig(raw) {
   const cooldown = Number.isInteger(raw.cooldownSec)
     ? Math.min(MAX_COOLDOWN_SEC, Math.max(MIN_COOLDOWN_SEC, raw.cooldownSec))
     : DEFAULT_COOLDOWN_SEC;
-  const mode = raw.mode === 'channel' && raw.channelId ? 'channel' : 'auto';
+  const channelId =
+    typeof raw.channelId === 'string' && raw.channelId.trim() ? raw.channelId.trim() : null;
   return {
-    enabled: raw.enabled !== false,
-    mode,
-    channelId: mode === 'channel' ? String(raw.channelId) : null,
+    enabled: Boolean(raw.enabled === true && channelId),
+    mode: 'channel',
+    channelId,
     cooldownSec: cooldown,
     updatedBy: raw.updatedBy ? String(raw.updatedBy) : null,
     updatedAt: raw.updatedAt || null,
@@ -161,6 +145,14 @@ function createGuildSuggestionsStore(dataDir = DEFAULT_DATA_DIR) {
   }
 
   function enableSuggestions(guildId, userId = null) {
+    const current = getGuildConfig(guildId);
+    if (!current.channelId) {
+      return {
+        ok: false,
+        error:
+          'Aucun salon de suggestions configure. Utilise d abord `/suggestions set salon:#salon` pour choisir un salon dedie.',
+      };
+    }
     return updateGuildConfig(guildId, (cur) => ({ ...cur, enabled: true }), userId);
   }
 
@@ -176,18 +168,6 @@ function createGuildSuggestionsStore(dataDir = DEFAULT_DATA_DIR) {
         enabled: true,
         mode: 'channel',
         channelId: String(channelId),
-      }),
-      userId
-    );
-  }
-
-  function setAutoChannel(guildId, userId = null) {
-    return updateGuildConfig(
-      guildId,
-      (cur) => ({
-        ...cur,
-        mode: 'auto',
-        channelId: null,
       }),
       userId
     );
@@ -216,13 +196,21 @@ function createGuildSuggestionsStore(dataDir = DEFAULT_DATA_DIR) {
     enableSuggestions,
     disableSuggestions,
     setSuggestionChannel,
-    setAutoChannel,
     setCooldown,
     resetGuildConfig,
   };
 }
 
 const defaultStore = createGuildSuggestionsStore(DEFAULT_DATA_DIR);
+
+function sanitizeAuditText(raw, maxLen = 120) {
+  return String(raw ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[`<>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
 
 function findChangeValue(changes, key) {
   if (!Array.isArray(changes)) return null;
@@ -238,17 +226,27 @@ function formatChangeDetails(entry, guild) {
     const key = ch.key;
     if (key === 'name' && (ch.old !== undefined || ch.new !== undefined)) {
       if (ch.old !== undefined && ch.new !== undefined && ch.old !== ch.new) {
-        details.push(`nom: "${ch.old}" -> "${ch.new}"`);
+        details.push(
+          `nom: "${sanitizeAuditText(ch.old, 60)}" -> "${sanitizeAuditText(ch.new, 60)}"`
+        );
       }
     } else if (key === 'topic') {
-      details.push(ch.new ? `sujet defini ("${String(ch.new).slice(0, 60)}")` : 'sujet efface');
+      details.push(
+        ch.new ? `sujet defini ("${sanitizeAuditText(ch.new, 60)}")` : 'sujet efface'
+      );
     } else if (key === 'rate_limit_per_user') {
       details.push(`cooldown: ${ch.old ?? 0}s -> ${ch.new ?? 0}s`);
     } else if (key === 'nsfw') {
       details.push(`NSFW: ${ch.new ? 'active' : 'desactive'}`);
     } else if (key === 'parent_id') {
       const cat = ch.new ? guild?.channels?.cache?.get?.(ch.new) : null;
-      details.push(cat ? `categorie -> "${cat.name}"` : ch.new ? 'categorie modifiee' : 'retire de categorie');
+      details.push(
+        cat
+          ? `categorie -> "${sanitizeAuditText(cat.name, 60)}"`
+          : ch.new
+            ? 'categorie modifiee'
+            : 'retire de categorie'
+      );
     } else if (key === 'type' && ch.new !== undefined) {
       details.push(`type: ${getChannelTypeLabel(ch.new)}`);
     } else if (key === 'color' && ch.new !== undefined) {
@@ -331,7 +329,7 @@ function describeAuditEntry(entry, guild) {
     nameChange?.new ||
     nameChange?.old ||
     (targetId ? `id:${targetId}` : 'inconnu');
-  const targetName = String(rawName);
+  const targetName = sanitizeAuditText(rawName, 100) || 'inconnu';
 
   const actionLabel = getAuditActionLabel(action, isCategory);
   const prefix = isRoleAction(action)
@@ -348,7 +346,7 @@ function describeAuditEntry(entry, guild) {
   if (entry?.extra) {
     const extraId = entry.extra.id || null;
     const extraRole = extraId ? guild?.roles?.cache?.get?.(extraId) : null;
-    const extraName = entry.extra.name || extraRole?.name || extraId;
+    const extraName = sanitizeAuditText(entry.extra.name || extraRole?.name || extraId, 80);
     if (extraName) {
       extras.push(`cible permission: ${extraName}`);
     }
@@ -372,6 +370,7 @@ function describeAuditEntry(entry, guild) {
 }
 
 function formatAuditBatchPrompt(events = [], actorName = 'Utilisateur') {
+  const safeActorName = sanitizeAuditText(actorName, 64) || 'Utilisateur';
   const uniqueLines = [];
   const seen = new Set();
   for (const ev of events) {
@@ -383,19 +382,19 @@ function formatAuditBatchPrompt(events = [], actorName = 'Utilisateur') {
 
   const numbered = uniqueLines.map((line, i) => `${i + 1}. ${line}`).join('\n');
   const auditSummary =
-    `Modifications manuelles detectees dans les Audit Logs par "${actorName}" :\n` +
-    `${numbered}\n\n` +
+    `Modifications manuelles detectees dans les Audit Logs par "${safeActorName}" :\n` +
+    `<audit_log_data>\n${numbered}\n</audit_log_data>\n\n` +
     'Analyse ce contexte et propose un plan d actions complementaires uniquement si c est pertinent.';
 
   let shortTriggerSummary;
   if (uniqueLines.length === 0) {
-    shortTriggerSummary = `Modification manuelle par ${actorName}`;
+    shortTriggerSummary = `Modification manuelle par ${safeActorName}`;
   } else if (uniqueLines.length === 1) {
-    shortTriggerSummary = `${actorName} — ${uniqueLines[0]}`;
+    shortTriggerSummary = `${safeActorName} — ${uniqueLines[0]}`;
   } else {
     const shown = uniqueLines.slice(0, 3).map((l) => `- ${l}`).join('\n');
     const more = uniqueLines.length > 3 ? `\n(+ ${uniqueLines.length - 3} autre(s))` : '';
-    shortTriggerSummary = `Modifications manuelles par ${actorName} :\n${shown}${more}`;
+    shortTriggerSummary = `Modifications manuelles par ${safeActorName} :\n${shown}${more}`;
   }
 
   return {
@@ -464,69 +463,20 @@ async function resolveChannelById(guild, channelId, client) {
 async function resolveSuggestionChannel(
   guild,
   client = null,
-  config = null,
-  events = [],
-  logStore = actionLogs
+  config = null
 ) {
   if (!guild) return null;
   const effectiveConfig = config || defaultStore.getGuildConfig(guild.id);
 
-  if (effectiveConfig.mode === 'channel' && effectiveConfig.channelId) {
-    return resolveChannelById(guild, effectiveConfig.channelId, client);
-  }
-
-  const writableChannels = listGuildChannels(guild).filter(
-    (ch) => isWritableSuggestionChannel(ch) && hasBotPostPerms(ch, client)
-  );
-
-  const findByCandidates = (candidates) => {
-    for (const candidate of candidates) {
-      const targetKey = normalizeKey(candidate);
-      const match = writableChannels.find((ch) => normalizeKey(ch.name) === targetKey);
-      if (match) return match;
-    }
+  if (!effectiveConfig.channelId) {
     return null;
-  };
-
-  // 1. Dedicated suggestion channels first
-  const dedicated = findByCandidates(SUGGESTION_CHANNEL_CANDIDATES.slice(0, 4));
-  if (dedicated) return dedicated;
-
-  // 2. Explicit log channel if configured
-  if (logStore && typeof logStore.getGuildLogConfig === 'function') {
-    const logCfg = logStore.getGuildLogConfig(guild.id);
-    if (logCfg && logCfg.mode === 'channel' && logCfg.channelId) {
-      const configuredLogChan = await resolveChannelById(guild, logCfg.channelId, client);
-      if (configuredLogChan) return configuredLogChan;
-    }
   }
 
-  // 3. Remaining common channels
-  const commonMatch = findByCandidates(SUGGESTION_CHANNEL_CANDIDATES.slice(4));
-  if (commonMatch) return commonMatch;
-
-  // 4. Target channel from recent audit events (if writable text channel)
-  for (const ev of events) {
-    if (!ev?.targetId || isRoleAction(ev.action)) continue;
-    const evChan = writableChannels.find((ch) => ch.id === ev.targetId);
-    if (evChan) return evChan;
-  }
-
-  // 5. System channel or first writable channel
-  if (
-    guild.systemChannel &&
-    isWritableSuggestionChannel(guild.systemChannel) &&
-    hasBotPostPerms(guild.systemChannel, client)
-  ) {
-    return guild.systemChannel;
-  }
-
-  return writableChannels[0] || null;
+  return resolveChannelById(guild, effectiveConfig.channelId, client);
 }
 
 function createAuditSuggestionsManager({
   store = defaultStore,
-  logStore = actionLogs,
   plannerFn = planner.buildProactivePlanFromAudit,
   createPlanFn = plans.createPlanRequest,
   hasPendingProactiveFn = plans.hasPendingProactivePlanForGuild,
@@ -538,21 +488,22 @@ function createAuditSuggestionsManager({
   const lastProposedAt = new Map();
   const inFlightGuilds = new Set();
 
-  async function processGuildBatch(guildId) {
-    const buf = pendingBuffers.get(guildId);
+  async function processGuildBatch(bufKey) {
+    const buf = pendingBuffers.get(bufKey);
     if (!buf) {
       return { ok: false, skipped: true, reason: 'no_buffer' };
     }
-    pendingBuffers.delete(guildId);
+    pendingBuffers.delete(bufKey);
     clearTimeout(buf.timer);
 
     const { guild, client, events, executorId, executor } = buf;
-    if (!guild || !events || events.length === 0) {
+    const guildId = guild?.id;
+    if (!guild || !guildId || !events || events.length === 0) {
       return { ok: false, skipped: true, reason: 'empty_batch' };
     }
 
     const config = store.getGuildConfig(guildId);
-    if (!config.enabled) {
+    if (!config.enabled || !config.channelId) {
       return { ok: false, skipped: true, reason: 'disabled' };
     }
 
@@ -587,21 +538,30 @@ function createAuditSuggestionsManager({
       const executorUser =
         executorMember?.user || executor || { id: executorId, username: 'Membre' };
       const actorName =
-        executorMember?.displayName ||
-        executorUser.username ||
-        executorUser.tag ||
-        'Membre';
+        sanitizeAuditText(
+          executorMember?.displayName ||
+            executorUser.username ||
+            executorUser.tag ||
+            'Membre',
+          64
+        ) || 'Membre';
+
+      const effectiveMember = executorMember || {
+        id: executorId,
+        user: executorUser,
+        permissions: new PermissionsBitField([]),
+        roles: { highest: { position: -1 } },
+      };
 
       const targetChannel = await resolveSuggestionChannel(
         guild,
         client,
-        config,
-        events,
-        logStore
+        config
       );
       if (!targetChannel) {
         console.log(
-          '[audit-suggestions] Aucun salon accessible en ecriture sur ' + guild.name
+          '[audit-suggestions] Salon de suggestions introuvable ou inaccessible sur ' +
+            guild.name
         );
         return { ok: false, skipped: true, reason: 'no_writable_channel' };
       }
@@ -621,7 +581,7 @@ function createAuditSuggestionsManager({
         auditSummary,
         actorName,
         guild,
-        member: executorMember,
+        member: effectiveMember,
         authorId: executorId,
       });
 
@@ -646,7 +606,7 @@ function createAuditSuggestionsManager({
         channel: targetChannel,
         guild,
         requester: executorUser,
-        requesterMember: executorMember,
+        requesterMember: effectiveMember,
         plan: planRes.plan,
         security: planRes.security,
         userText: '[Suggestion proactive - Audit Log] ' + shortTriggerSummary,
@@ -707,7 +667,7 @@ function createAuditSuggestionsManager({
     if (entry.executor?.bot) return false;
 
     const config = store.getGuildConfig(guild.id);
-    if (!config.enabled) return false;
+    if (!config.enabled || !config.channelId) return false;
 
     const prevTs = lastProposedAt.get(guild.id) || 0;
     if (prevTs && Date.now() - prevTs < config.cooldownSec * 1000) {
@@ -720,7 +680,8 @@ function createAuditSuggestionsManager({
     }
 
     const described = describeAuditEntry(entry, guild);
-    let buf = pendingBuffers.get(guild.id);
+    const bufKey = `${guild.id}:${executorId}`;
+    let buf = pendingBuffers.get(bufKey);
     if (!buf) {
       buf = {
         guild,
@@ -730,11 +691,10 @@ function createAuditSuggestionsManager({
         executor: entry.executor || null,
         timer: null,
       };
-      pendingBuffers.set(guild.id, buf);
+      pendingBuffers.set(bufKey, buf);
     } else {
       buf.guild = guild;
       buf.client = client || guild.client || buf.client;
-      buf.executorId = executorId;
       if (entry.executor) buf.executor = entry.executor;
     }
 
@@ -746,7 +706,7 @@ function createAuditSuggestionsManager({
       clearTimeout(buf.timer);
     }
     buf.timer = setTimeout(() => {
-      processGuildBatch(guild.id).catch((err) => {
+      processGuildBatch(bufKey).catch((err) => {
         console.error('[audit-suggestions] Erreur batch async :', err);
       });
     }, debounceMs);
@@ -783,13 +743,11 @@ module.exports = {
   MIN_COOLDOWN_SEC,
   MAX_COOLDOWN_SEC,
   PROACTIVE_PLAN_TIMEOUT_MS,
-  SUGGESTION_CHANNEL_CANDIDATES,
   createGuildSuggestionsStore,
   getGuildConfig: defaultStore.getGuildConfig,
   enableSuggestions: defaultStore.enableSuggestions,
   disableSuggestions: defaultStore.disableSuggestions,
   setSuggestionChannel: defaultStore.setSuggestionChannel,
-  setAutoChannel: defaultStore.setAutoChannel,
   setCooldown: defaultStore.setCooldown,
   resetGuildConfig: defaultStore.resetGuildConfig,
   describeAuditEntry,
